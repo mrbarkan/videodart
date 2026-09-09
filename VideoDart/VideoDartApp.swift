@@ -36,7 +36,7 @@ struct VideoDartApp: App {
     @State private var converter = ConvertQueue()
     @State private var presets = PresetStore()
     @State private var updater = Updater()
-    @Environment(\.openWindow) private var openWindow
+    @State private var navigator = Navigator()
 
     init() {
         Prefs.register()
@@ -50,6 +50,9 @@ struct VideoDartApp: App {
         WindowGroup {
             ContentView()
                 .environment(queue)
+                .environment(converter)
+                .environment(presets)
+                .environment(navigator)
         }
         .defaultSize(width: 860, height: 580)
         .commands {
@@ -58,8 +61,15 @@ struct VideoDartApp: App {
                     .disabled(!updater.canCheck)
             }
             CommandGroup(replacing: .newItem) {
-                Button("Convert Files…") { openWindow(id: Self.convertWindowID) }
+                Button("Convert Files…") { navigator.pane = .convert }
                     .keyboardShortcut("c", modifiers: [.command, .shift])
+            }
+            CommandGroup(before: .toolbar) {
+                Picker("View", selection: Bindable(navigator).pane) {
+                    ForEach(Navigator.Pane.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.inline)
+                Divider()
             }
             CommandMenu("Downloads") {
                 Button("Pause All") { queue.pauseAll() }
@@ -72,18 +82,6 @@ struct VideoDartApp: App {
             }
         }
 
-        // A separate window rather than a tab: converting a folder of clips and watching
-        // a playlist download are two jobs people run at the same time, and each keeps
-        // its own queue alive whether or not the other is on screen.
-        Window("Convert", id: Self.convertWindowID) {
-            ConvertView()
-                .environment(converter)
-                .environment(presets)
-        }
-        .defaultSize(width: 900, height: 560)
-
         Settings { SettingsView() }
     }
-
-    private static let convertWindowID = "convert"
 }

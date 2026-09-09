@@ -74,6 +74,16 @@ final class ConvertQueue {
         pump()
     }
 
+    /// Hands finished jobs back to the staging list so their settings can be changed and
+    /// run again, and clears them from the queue. The "convert that again, but smaller"
+    /// path — otherwise the only way back is to find the files in Finder and re-drop them.
+    @discardableResult
+    func drainFinished() -> [ConvertJob] {
+        let finished = jobs.filter { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
+        jobs.removeAll { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
+        return finished
+    }
+
     func clearFinished() {
         jobs.removeAll { $0.state == .done || $0.state == .failed || $0.state == .cancelled }
     }
@@ -105,8 +115,9 @@ final class ConvertQueue {
             $0.error = nil
             $0.outputPath = output.path
             // Trimming makes the output shorter than the source, so the progress
-            // denominator is the span, not what ffmpeg reports for the input.
-            $0.duration = FFmpeg.trimDuration($0)
+            // denominator is the span, not what ffmpeg reports for the input. When the
+            // source was probed on drop this is already known before ffmpeg says a word.
+            $0.duration = FFmpeg.effectiveDuration($0)
         }
         logs[id] = []
 

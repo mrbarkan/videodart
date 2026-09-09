@@ -1,6 +1,48 @@
 import SwiftUI
 import AppKit
 
+/// Which half of the app is on screen. One window with a switch rather than two windows:
+/// the two queues run independently either way, and a second window that had to be found
+/// in the Window menu was the only way to reach conversion at all.
+@MainActor @Observable
+final class Navigator {
+    enum Pane: String, CaseIterable, Identifiable, Hashable {
+        case download, convert
+        var id: String { rawValue }
+        var label: String { self == .download ? "Download" : "Convert" }
+        var symbol: String { self == .download ? "arrow.down.circle" : "wand.and.rays" }
+    }
+
+    var pane: Pane = .download
+}
+
+struct ContentView: View {
+    @Environment(Navigator.self) private var navigator
+
+    var body: some View {
+        @Bindable var nav = navigator
+        Group {
+            switch navigator.pane {
+            case .download: DownloadPane()
+            case .convert: ConvertView()
+            }
+        }
+        .frame(minWidth: 820, minHeight: 480)
+        .toolbar {
+            ToolbarItem(placement: .navigation) {
+                Picker("View", selection: $nav.pane) {
+                    ForEach(Navigator.Pane.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 170)
+                .help("Switch between downloading and converting (⌘1 / ⌘2)")
+            }
+        }
+    }
+}
+
+
 /// Translucency is a material, not decoration — when the system asks for less of it,
 /// fall back to a solid control rather than a glass one that loses contrast.
 private struct AdaptiveGlass: ViewModifier {
@@ -72,7 +114,7 @@ private struct NoticeBanner: View {
     }
 }
 
-struct ContentView: View {
+struct DownloadPane: View {
     @Environment(DownloadQueue.self) private var queue
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -116,7 +158,6 @@ struct ContentView: View {
                 .animation(settle, value: queue.jobs.map(\.state))
             }
         }
-        .frame(minWidth: 700, minHeight: 420)
         .toolbar { toolbar }
         .safeAreaInset(edge: .top, spacing: 0) { banners }
         .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }

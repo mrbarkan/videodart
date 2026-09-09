@@ -2,15 +2,18 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// A file waiting to be converted. Trim points live here rather than on the preset
-/// because they are a property of this clip, not of the settings you save and reuse.
-private struct StagedFile: Identifiable, Hashable {
+/// One thing to produce from one source file. A file can have several — the same clip as
+/// an MP4 and an MP3, say — which is why the preset lives here and not on the file.
+struct StagedOutput: Identifiable, Hashable {
     let id = UUID()
-    var url: URL
+    var preset: ConvertPreset
     var trimStart = ""
     var trimEnd = ""
+    /// Result of the Measure button. Cleared whenever the settings it described change,
+    /// because a stale measurement is worse than no measurement.
+    var measured: Int64?
+    var measuring = false
 
-    /// A field that is neither empty nor a valid timecode; the Convert button waits.
     var trimIsValid: Bool {
         (trimStart.isEmpty || Timecode.seconds(trimStart) != nil)
             && (trimEnd.isEmpty || Timecode.seconds(trimEnd) != nil)
@@ -19,15 +22,40 @@ private struct StagedFile: Identifiable, Hashable {
     }
 }
 
+/// A dropped file plus what ffmpeg says about it. The probe is what makes a size estimate
+/// possible at all: every estimate is a bitrate multiplied by a duration.
+struct StagedFile: Identifiable, Hashable {
+    let id = UUID()
+    var url: URL
+    var probe: FFmpeg.MediaProbe?
+    var outputs: [StagedOutput]
+
+    var caption: String {
+        var parts: [String] = []
+        if let d = probe?.duration { parts.append(d.asDuration) }
+        if let r = probe?.resolution { parts.append(r) }
+        if let bytes = probe?.bytes, bytes > 0 { parts.append(ByteCount.string(bytes)) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+enum ByteCount {
+    static func string(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+}
+
 struct ConvertView: View {
+    @Environment(ConvertQueue.self) private var queue
+    @Environment(PresetStore.self) private var presets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    @Environment(ConvertQueue.self) private var queue
-    @Environment(PresetStore.self) private var presets
-    @State private var preset = ConvertPreset.builtIns[0]
-    @State private var pickedPresetID = ConvertPreset.builtIns[0].id
     @State private var staged: [StagedFile] = []
+    @State private var selection: Set<UUID> = []
+    /// The preset new outputs get, and what the inspector edits when nothing is selected.
+    @State private var workingPreset = ConvertPreset.builtIns[0]
+    @State private var pickedPresetID = ConvertPreset.builtIns[0].id
     @State private var isDropTarget = false
     @State private var showInspector = true
     @State private var savingPreset = false
@@ -41,19 +69,27 @@ struct ConvertView: View {
     private var settle: Animation? { reduceMotion ? nil : .smooth(duration: 0.35) }
     private var quick: Animation? { reduceMotion ? nil : .smooth(duration: 0.18) }
 
-    private var canConvert: Bool {
-        ffmpegInstalled && !staged.isEmpty && staged.allSatisfy(\.trimIsValid)
+    private var allOutputs: [(file: StagedFile, output: StagedOutput)] {
+        staged.flatMap { file in file.outputs.map { (file, $0) } }
     }
 
-    /// True once the controls no longer match the preset that was picked — the cue for
-    /// offering "Save as Preset", and for not pretending a built-in was changed.
-    private var isModified: Bool {
-        guard let original = presets.all.first(where: { $0.id == pickedPresetID }) else { return true }
-        var comparable = preset
-        comparable.id = original.id
-        comparable.name = original.name
-        comparable.isBuiltIn = original.isBuiltIn
-        return comparable != original
+    private var selectedOutputs: [(file: StagedFile, output: StagedOutput)] {
+        allOutputs.filter { selection.contains($0.output.id) }
+    }
+
+    private var canConvert: Bool {
+        ffmpegInstalled && !allOutputs.isEmpty && allOutputs.allSatisfy { $0.output.trimIsValid }
+    }
+
+    /// Total of every estimate we have. Outputs still waiting on a Measure are excluded,
+    /// so the number is flagged as a floor rather than quietly counting them as zero.
+    private var totalEstimate: (bytes: Int64, complete: Bool) {
+        var total: Int64 = 0
+        var complete = true
+        for pair in allOutputs {
+            if let bytes = estimate(pair.file, pair.output) { total += bytes } else { complete = false }
+        }
+        return (total, complete)
     }
 
     var body: some View {
@@ -63,17 +99,13 @@ struct ConvertView: View {
             Divider()
             footer
         }
-        .frame(minWidth: 620, minHeight: 460)
         .toolbar { toolbar }
         .inspector(isPresented: $showInspector) {
-            PresetEditor(preset: $preset)
-                .inspectorColumnWidth(min: 260, ideal: 300, max: 360)
+            PresetEditor(preset: editedPreset, scope: inspectorScope)
+                .inspectorColumnWidth(min: 280, ideal: 320, max: 400)
         }
         .dropDestination(for: URL.self) { urls, _ in
-            let media = urls.filter(FFmpeg.isMedia)
-            guard !media.isEmpty else { return false }
-            withAnimation(settle) { staged += media.map { StagedFile(url: $0) } }
-            return true
+            adopt(urls.filter(FFmpeg.isMedia))
         } isTargeted: { isDropTarget = $0 }
         .overlay {
             RoundedRectangle(cornerRadius: 10)
@@ -92,27 +124,60 @@ struct ConvertView: View {
             Text("These settings become a preset you can pick again.")
         }
         .onChange(of: pickedPresetID) { _, id in
-            if let picked = presets.all.first(where: { $0.id == id }) { preset = picked }
+            guard let picked = presets.all.first(where: { $0.id == id }) else { return }
             rememberedPreset = id.uuidString
+            // Picking a preset with rows selected is how you say "these files, this
+            // preset" — the whole point of being able to select more than one.
+            if selection.isEmpty { workingPreset = picked } else { apply(picked) }
         }
-        // The window is closable, so reopening it should not silently drop back to the
-        // first built-in after the user picked something else.
         .task {
             if let saved = UUID(uuidString: rememberedPreset),
                let picked = presets.all.first(where: { $0.id == saved }) {
                 pickedPresetID = picked.id
-                preset = picked
+                workingPreset = picked
             }
+            #if DEBUG
+            // Same convention as VD_OPEN_SHEET on the download side: the staging list is
+            // otherwise only reachable by dropping files, which a test cannot do. Runs
+            // after the preset is restored, so staged rows get the one a drop would get.
+            if let paths = ProcessInfo.processInfo.environment["VD_STAGE"], !paths.isEmpty {
+                _ = adopt(paths.split(separator: "\n").map { URL(fileURLWithPath: String($0)) })
+            }
+            #endif
         }
-        // Changing the codec can strand the container on something ffmpeg will not
-        // mux — H.265 stays selected while the container still says WebM, and the job
-        // fails a minute later instead of at the moment of the choice.
-        .onChange(of: preset.videoCodec) { _, _ in snapContainer() }
-        .onChange(of: preset.audioCodec) { _, _ in snapContainer() }
-        .onChange(of: preset.includeVideo) { _, _ in snapContainer() }
-        .onChange(of: preset.includeAudio) { _, _ in snapContainer() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             ffmpegInstalled = FFmpeg.isInstalled
+        }
+    }
+
+    // MARK: - Inspector plumbing
+
+    private var inspectorScope: String {
+        switch selectedOutputs.count {
+        case 0: "Settings for files you add"
+        case 1: selectedOutputs[0].file.url.lastPathComponent
+        case let n: "Editing \(n) outputs"
+        }
+    }
+
+    /// Reads the first selected output and writes to every selected one, so editing a
+    /// control with six rows selected sets all six. With nothing selected it edits the
+    /// preset that newly added outputs will get.
+    private var editedPreset: Binding<ConvertPreset> {
+        Binding(
+            get: { selectedOutputs.first?.output.preset ?? workingPreset },
+            set: { updated in
+                let fixed = updated.reconciled()
+                if selection.isEmpty { workingPreset = fixed } else { apply(fixed) }
+            })
+    }
+
+    private func apply(_ preset: ConvertPreset) {
+        for f in staged.indices {
+            for o in staged[f].outputs.indices where selection.contains(staged[f].outputs[o].id) {
+                staged[f].outputs[o].preset = preset
+                staged[f].outputs[o].measured = nil    // it described the old settings
+            }
         }
     }
 
@@ -121,40 +186,32 @@ struct ConvertView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItem(placement: .principal) {
-            HStack(spacing: 6) {
-                Picker("Preset", selection: $pickedPresetID) {
-                    Section("Built-in") {
-                        ForEach(ConvertPreset.builtIns) { Text($0.name).tag($0.id) }
-                    }
-                    if !presets.custom.isEmpty {
-                        Section("Yours") {
-                            ForEach(presets.custom) { Text($0.name).tag($0.id) }
-                        }
-                    }
+            Picker("Preset", selection: $pickedPresetID) {
+                Section("Built-in") {
+                    ForEach(ConvertPreset.builtIns) { Text($0.name).tag($0.id) }
                 }
-                .labelsHidden()
-                .frame(minWidth: 200)
-
-                if isModified {
-                    Text("Modified")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .transition(.opacity)
+                if !presets.custom.isEmpty {
+                    Section("Yours") {
+                        ForEach(presets.custom) { Text($0.name).tag($0.id) }
+                    }
                 }
             }
-            .animation(quick, value: isModified)
+            .labelsHidden()
+            .frame(minWidth: 190)
+            .help(selection.isEmpty
+                  ? "The preset new files get"
+                  : "Apply to the \(selection.count) selected output\(selection.count == 1 ? "" : "s")")
         }
         ToolbarItem {
             Menu("Presets", systemImage: "slider.horizontal.3") {
                 Button("Save as Preset…") { beginSavePreset() }
                 if let current = presets.custom.first(where: { $0.id == pickedPresetID }) {
                     Button("Update “\(current.name)”") {
-                        var updated = preset
+                        var updated = editedPreset.wrappedValue
                         updated.id = current.id
                         updated.name = current.name
                         presets.save(updated)
                     }
-                    .disabled(!isModified)
                     Divider()
                     Button("Delete “\(current.name)”", role: .destructive) {
                         presets.delete(current.id)
@@ -186,20 +243,28 @@ struct ConvertView: View {
             ContentUnavailableView {
                 Label("Drop Files to Convert", systemImage: "arrow.down.doc")
             } description: {
-                Text("Drag video or audio files onto this window, or use Add Files.")
+                Text("Drag video or audio files here, or use Add Files. Each file can have more than one output.")
             } actions: {
                 Button("Add Files…") { chooseFiles() }
                     .adaptiveGlass(prominent: true)
             }
         } else {
-            List {
-                if !staged.isEmpty {
-                    Section("Ready to convert") {
-                        ForEach($staged) { file in
-                            StagedRow(file: file) {
-                                withAnimation(settle) { staged.removeAll { $0.id == file.id } }
-                            }
+            List(selection: $selection) {
+                ForEach($staged) { $file in
+                    Section {
+                        ForEach($file.outputs) { $output in
+                            OutputRow(output: $output,
+                                      estimate: estimate(file, output),
+                                      onMeasure: { measure(file.id, output.id) },
+                                      onRemove: { remove(output.id, from: file.id) })
+                            .tag(output.id)
                         }
+                    } header: {
+                        FileHeader(file: file,
+                                   onAdd: { addOutput(to: file.id) },
+                                   onRemove: {
+                                       withAnimation(settle) { staged.removeAll { $0.id == file.id } }
+                                   })
                     }
                 }
                 if !queue.jobs.isEmpty {
@@ -210,6 +275,11 @@ struct ConvertView: View {
             }
             .listStyle(.inset)
             .animation(settle, value: queue.jobs.map(\.state))
+            .contextMenu(forSelectionType: UUID.self) { ids in
+                if !ids.isEmpty {
+                    Button("Remove \(ids.count) Output\(ids.count == 1 ? "" : "s")") { removeSelected(ids) }
+                }
+            }
         }
     }
 
@@ -218,7 +288,7 @@ struct ConvertView: View {
             if let overall = queue.overallProgress, queue.activeCount > 0 {
                 ProgressView(value: overall)
                     .progressViewStyle(.linear)
-                    .frame(width: 80)
+                    .frame(width: 70)
             }
             Menu {
                 Button("Alongside the original") { convertDir = "" }
@@ -238,10 +308,25 @@ struct ConvertView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
 
+            if !allOutputs.isEmpty {
+                Divider().frame(height: 14)
+                let total = totalEstimate
+                Text(total.bytes > 0
+                     ? "\(total.complete ? "" : "at least ")\(ByteCount.string(total.bytes))"
+                     : "size unknown")
+                    .monospacedDigit()
+                    .help(total.complete
+                          ? "Estimated total output size"
+                          : "Some outputs use CRF, whose size cannot be known without measuring")
+            }
+
             Spacer()
 
             if queue.hasFinished {
-                Button("Clear Finished") { queue.clearFinished() }
+                Button("Reset") { resetFinished() }
+                    .controlSize(.small)
+                    .help("Put finished files back in the list so you can change settings and convert again")
+                Button("Clear") { queue.clearFinished() }
                     .controlSize(.small)
             }
             Button(convertLabel) { convert() }
@@ -250,6 +335,7 @@ struct ConvertView: View {
                 .disabled(!canConvert)
         }
         .font(.callout)
+        .foregroundStyle(.secondary)
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(reduceTransparency ? AnyShapeStyle(.background) : AnyShapeStyle(.bar))
@@ -257,10 +343,9 @@ struct ConvertView: View {
     }
 
     private var convertLabel: String {
-        staged.count > 1 ? "Convert \(staged.count) Files" : "Convert"
+        allOutputs.count > 1 ? "Convert \(allOutputs.count) Outputs" : "Convert"
     }
 
-    /// Same one-button setup the download window offers; ffmpeg is shared between them.
     private var missingFFmpeg: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
@@ -292,15 +377,108 @@ struct ConvertView: View {
         .background(reduceTransparency ? AnyShapeStyle(.background) : AnyShapeStyle(.regularMaterial))
     }
 
+    // MARK: - Estimating
+
+    private func estimate(_ file: StagedFile, _ output: StagedOutput) -> Int64? {
+        if let measured = output.measured { return measured }
+        let job = job(for: file, output)
+        return output.preset.estimatedBytes(duration: FFmpeg.effectiveDuration(job),
+                                            sourceBytes: file.probe?.bytes,
+                                            sourceDuration: file.probe?.duration)
+    }
+
+    private func measure(_ fileID: UUID, _ outputID: UUID) {
+        guard let f = staged.firstIndex(where: { $0.id == fileID }),
+              let o = staged[f].outputs.firstIndex(where: { $0.id == outputID }) else { return }
+        staged[f].outputs[o].measuring = true
+        let job = job(for: staged[f], staged[f].outputs[o])
+        Task {
+            let bytes = await FFmpeg.sampleBytes(for: job)
+            guard let f = staged.firstIndex(where: { $0.id == fileID }),
+                  let o = staged[f].outputs.firstIndex(where: { $0.id == outputID }) else { return }
+            staged[f].outputs[o].measuring = false
+            staged[f].outputs[o].measured = bytes
+        }
+    }
+
+    private func job(for file: StagedFile, _ output: StagedOutput) -> ConvertJob {
+        var job = ConvertJob(source: file.url, preset: output.preset,
+                             sourceDuration: file.probe?.duration, sourceBytes: file.probe?.bytes,
+                             destinationDir: convertDir.isEmpty ? nil : convertDir)
+        job.trimStart = output.trimStart
+        job.trimEnd = output.trimEnd
+        return job
+    }
+
     // MARK: - Actions
 
+    private func adopt(_ urls: [URL]) -> Bool {
+        guard !urls.isEmpty else { return false }
+        let fresh = urls.map { StagedFile(url: $0, outputs: [StagedOutput(preset: workingPreset)]) }
+        withAnimation(settle) { staged += fresh }
+        // Duration and dimensions decide every size estimate, so read them right away
+        // rather than making the user press Convert to find out what they dropped.
+        for file in fresh {
+            Task {
+                let probe = await FFmpeg.inspect(file.url)
+                if let i = staged.firstIndex(where: { $0.id == file.id }) { staged[i].probe = probe }
+            }
+        }
+        return true
+    }
+
+    private func addOutput(to fileID: UUID) {
+        guard let i = staged.firstIndex(where: { $0.id == fileID }) else { return }
+        let output = StagedOutput(preset: workingPreset)
+        withAnimation(settle) { staged[i].outputs.append(output) }
+        selection = [output.id]
+    }
+
+    private func remove(_ outputID: UUID, from fileID: UUID) {
+        guard let i = staged.firstIndex(where: { $0.id == fileID }) else { return }
+        withAnimation(settle) {
+            staged[i].outputs.removeAll { $0.id == outputID }
+            // A file with nothing left to produce is just clutter.
+            if staged[i].outputs.isEmpty { staged.remove(at: i) }
+        }
+        selection.remove(outputID)
+    }
+
+    private func removeSelected(_ ids: Set<UUID>) {
+        withAnimation(settle) {
+            for i in staged.indices { staged[i].outputs.removeAll { ids.contains($0.id) } }
+            staged.removeAll { $0.outputs.isEmpty }
+        }
+        selection.subtract(ids)
+    }
+
     private func convert() {
-        let destination = convertDir.isEmpty ? nil : convertDir
-        queue.add(staged.map {
-            ConvertJob(source: $0.url, preset: preset, destinationDir: destination,
-                       trimStart: $0.trimStart, trimEnd: $0.trimEnd)
-        })
+        queue.add(allOutputs.map { job(for: $0.file, $0.output) })
         withAnimation(settle) { staged.removeAll() }
+        selection = []
+    }
+
+    /// Finished jobs go back to the list with their settings intact, ready to be changed
+    /// and run again. Outputs from the same source regroup under one file.
+    private func resetFinished() {
+        let finished = queue.drainFinished()
+        guard !finished.isEmpty else { return }
+        withAnimation(settle) {
+            for job in finished {
+                var output = StagedOutput(preset: job.preset)
+                output.trimStart = job.trimStart
+                output.trimEnd = job.trimEnd
+                if let i = staged.firstIndex(where: { $0.url == job.source }) {
+                    staged[i].outputs.append(output)
+                } else {
+                    staged.append(StagedFile(
+                        url: job.source,
+                        probe: FFmpeg.MediaProbe(duration: job.sourceDuration,
+                                                 bytes: job.sourceBytes ?? 0),
+                        outputs: [output]))
+                }
+            }
+        }
     }
 
     private func chooseFiles() {
@@ -309,7 +487,7 @@ struct ConvertView: View {
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.audiovisualContent, .movie, .video, .audio]
         guard panel.runModal() == .OK else { return }
-        withAnimation(settle) { staged += panel.urls.map { StagedFile(url: $0) } }
+        _ = adopt(panel.urls)
     }
 
     private func chooseDestination() {
@@ -321,53 +499,82 @@ struct ConvertView: View {
     }
 
     private func beginSavePreset() {
-        newPresetName = isModified ? "\(preset.name) Copy" : preset.name
+        newPresetName = editedPreset.wrappedValue.name + " Copy"
         savingPreset = true
     }
 
     private func commitPreset() {
-        var fresh = preset
+        var fresh = editedPreset.wrappedValue
         fresh.id = UUID()
         fresh.name = newPresetName.trimmingCharacters(in: .whitespaces)
         presets.save(fresh)
-        preset = fresh
         pickedPresetID = fresh.id
-    }
-
-    private func snapContainer() {
-        let allowed = preset.allowedContainers
-        if !allowed.contains(preset.container), let first = allowed.first {
-            preset.container = first
-        }
     }
 }
 
 // MARK: - Rows
 
-private struct StagedRow: View {
-    @Binding var file: StagedFile
+private struct FileHeader: View {
+    let file: StagedFile
+    var onAdd: () -> Void
+    var onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(file.url.lastPathComponent)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textCase(nil)                       // section headers upper-case by default
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.primary)
+            if !file.caption.isEmpty {
+                Text(file.caption).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button("Add Output", systemImage: "plus", action: onAdd)
+                .help("Convert this file to another format as well")
+            Button("Remove File", systemImage: "xmark", action: onRemove)
+        }
+        .labelStyle(.iconOnly)
+        .buttonStyle(.borderless)
+        .padding(.vertical, 2)
+    }
+}
+
+private struct OutputRow: View {
+    @Binding var output: StagedOutput
+    let estimate: Int64?
+    var onMeasure: () -> Void
     var onRemove: () -> Void
     @State private var hovering = false
 
+    /// CRF is the only mode whose size cannot be worked out from the settings, so it is
+    /// the only one that gets a Measure button.
+    private var needsMeasuring: Bool {
+        estimate == nil && output.preset.qualityMode == .crf && !output.preset.isCopyOnly
+    }
+
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "film")
-                .foregroundStyle(.secondary)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(file.url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(output.preset.name).lineLimit(1)
+                Text(output.preset.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 HStack(spacing: 6) {
                     Text("Trim").font(.caption).foregroundStyle(.secondary)
-                    TextField("start", text: $file.trimStart)
-                        .frame(width: 68)
+                    TextField("start", text: $output.trimStart)
+                        .frame(width: 64)
+                        .onChange(of: output.trimStart) { _, _ in output.measured = nil }
                     Text("to").font(.caption).foregroundStyle(.secondary)
-                    TextField("end", text: $file.trimEnd)
-                        .frame(width: 68)
-                    if !file.trimIsValid {
-                        Label("Use 1:23 or 0:01:23", systemImage: "exclamationmark.circle")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .labelStyle(.titleAndIcon)
+                    TextField("end", text: $output.trimEnd)
+                        .frame(width: 64)
+                        .onChange(of: output.trimEnd) { _, _ in output.measured = nil }
+                    if !output.trimIsValid {
+                        Label("Use 1:23", systemImage: "exclamationmark.circle")
+                            .font(.caption).foregroundStyle(.red)
                     }
                 }
                 .textFieldStyle(.roundedBorder)
@@ -375,13 +582,35 @@ private struct StagedRow: View {
                 .monospacedDigit()
             }
             Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 2) {
+                if output.measuring {
+                    ProgressView().controlSize(.small)
+                } else if let estimate {
+                    Text((output.measured != nil ? "≈ " : "") + ByteCount.string(estimate))
+                        .monospacedDigit()
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                } else if needsMeasuring {
+                    Button("Measure", action: onMeasure)
+                        .controlSize(.small)
+                        .help("Encodes a few seconds and scales it up — CRF size cannot be calculated")
+                } else {
+                    Text("—").foregroundStyle(.tertiary)
+                }
+                if output.measured != nil {
+                    Text("sampled").font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            .frame(width: 88, alignment: .trailing)
+
             Button("Remove", systemImage: "xmark", action: onRemove)
                 .labelStyle(.iconOnly)
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
                 .opacity(hovering ? 1 : 0)
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 3)
         .contentShape(.rect)
         .onHover { hovering = $0 }
     }
@@ -398,9 +627,7 @@ private struct ConvertRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: icon)
-                .foregroundStyle(tint)
-                .frame(width: 20)
+            Image(systemName: icon).foregroundStyle(tint).frame(width: 20)
             VStack(alignment: .leading, spacing: 3) {
                 Text(job.title).lineLimit(1).truncationMode(.middle)
                 Text(job.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -425,9 +652,7 @@ private struct ConvertRow: View {
         .onTapGesture(count: 2) { open() }
         .contextMenu {
             Button("Show in Finder") { reveal() }.disabled(fileURL == nil)
-            Button("Show Original") {
-                NSWorkspace.shared.activateFileViewerSelecting([job.source])
-            }
+            Button("Show Original") { NSWorkspace.shared.activateFileViewerSelecting([job.source]) }
             if let details = job.details {
                 Divider()
                 Button("Copy Error Details") {
@@ -457,15 +682,16 @@ private struct ConvertRow: View {
     }
 
     private var detail: String {
-        [job.progress > 0 ? "\(Int(job.progress * 100))%" : "",
-         job.outputSize, job.speed]
+        [job.progress > 0 ? "\(Int(job.progress * 100))%" : "", job.outputSize, job.speed]
             .filter { !$0.isEmpty }
             .joined(separator: "  ·  ")
     }
 
     private var status: String {
         switch job.state {
-        case .done: fileURL?.lastPathComponent ?? "Done"
+        case .done:
+            [fileURL?.lastPathComponent, job.outputSize.isEmpty ? nil : job.outputSize]
+                .compactMap { $0 }.joined(separator: "  ·  ")
         case .failed: job.error ?? "Failed"
         default: job.state.label
         }
@@ -478,8 +704,10 @@ private struct ConvertRow: View {
             case .queued, .converting:
                 Button("Cancel", systemImage: "xmark") { queue.cancel(job.id) }
             case .failed, .cancelled:
-                Button("Retry", systemImage: "arrow.clockwise") { queue.retry(job.id) }
+                Button("Try Again", systemImage: "arrow.clockwise") { queue.retry(job.id) }
             case .done:
+                Button("Convert Again", systemImage: "arrow.clockwise") { queue.retry(job.id) }
+                    .help("Run this again with the same settings")
                 Button("Show in Finder", systemImage: "folder") { reveal() }
             }
             Button("Remove", systemImage: "trash") { queue.remove(job.id) }
@@ -487,7 +715,7 @@ private struct ConvertRow: View {
         .labelStyle(.iconOnly)
         .adaptiveGlass()
         .controlSize(.small)
-        .frame(width: 62, alignment: .trailing)
+        .frame(width: 92, alignment: .trailing)
     }
 
     private func open() {
@@ -507,8 +735,7 @@ private struct ConvertRow: View {
 /// actually supports, so a preset can never name an encoder this build lacks.
 private struct PresetEditor: View {
     @Binding var preset: ConvertPreset
-    /// The only text field in the form, so SwiftUI hands it first responder on open with
-    /// its contents selected — one stray keystroke from wiping the preset's flags.
+    let scope: String
     @FocusState private var editingFlags: Bool
 
     private static let heights = [(0, "Keep original"), (2160, "2160p"), (1440, "1440p"),
@@ -518,6 +745,15 @@ private struct PresetEditor: View {
 
     var body: some View {
         Form {
+            Section {
+                Text(scope)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             Section("Video") {
                 Toggle("Include video", isOn: $preset.includeVideo)
                 if preset.includeVideo {
@@ -543,9 +779,9 @@ private struct PresetEditor: View {
                         ForEach(Encoders.availableAudio) { Text($0.label).tag($0.id) }
                     }
                     if Encoders.audio(preset.audioCodec)?.takesBitrate == true {
-                        Picker("Bitrate", selection: $preset.audioBitrate) {
-                            ForEach(["320k", "256k", "192k", "160k", "128k", "96k"], id: \.self) {
-                                Text($0).tag($0)
+                        Picker("Bitrate", selection: $preset.audioKbps) {
+                            ForEach([320, 256, 192, 160, 128, 96], id: \.self) {
+                                Text("\($0) kbps").tag($0)
                             }
                         }
                     }
@@ -577,15 +813,52 @@ private struct PresetEditor: View {
 
     @ViewBuilder
     private var quality: some View {
-        switch Encoders.video(preset.videoCodec)?.quality {
-        case .crf:
-            let range = Encoders.video(preset.videoCodec)?.crfRange ?? 0...51
-            VStack(alignment: .leading, spacing: 2) {
+        let modes = preset.availableQualityModes
+        if !modes.isEmpty {
+            Picker("Set by", selection: $preset.qualityMode) {
+                ForEach(modes) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+
+            switch preset.qualityMode {
+            case .targetSize:
+                LabeledContent("Target") {
+                    HStack(spacing: 4) {
+                        TextField("Target", value: $preset.targetSizeMB,
+                                  format: .number.precision(.fractionLength(0...1)))
+                            .labelsHidden()
+                            .frame(width: 58)
+                            .multilineTextAlignment(.trailing)
+                            .monospacedDigit()
+                        Text("MB")
+                    }
+                }
+                Text("The bitrate is worked out per file from its length, and peaks are capped so a busy scene can't overshoot.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+            case .bitrate:
+                LabeledContent("Video") {
+                    HStack(spacing: 4) {
+                        TextField("Video bitrate", value: $preset.videoKbps, format: .number)
+                            .labelsHidden()
+                            .frame(width: 66)
+                            .multilineTextAlignment(.trailing)
+                            .monospacedDigit()
+                        Text("kbps")
+                    }
+                }
+                Picker("Common", selection: $preset.videoKbps) {
+                    ForEach([20000, 12000, 8000, 5000, 3000, 1500, 800], id: \.self) {
+                        Text(ConvertPreset.rateLabel($0)).tag($0)
+                    }
+                }
+
+            case .crf:
                 // Lower is better is the opposite of every other quality slider people
                 // meet, so the number and its direction are both spelled out.
-                LabeledContent("Quality") {
-                    Text("CRF \(preset.crf)").monospacedDigit()
-                }
+                let range = Encoders.video(preset.videoCodec)?.crfRange ?? 0...51
+                LabeledContent("Quality") { Text("CRF \(preset.crf)").monospacedDigit() }
                 Slider(value: Binding(get: { Double(preset.crf) },
                                       set: { preset.crf = Int($0.rounded()) }),
                        in: Double(range.lowerBound)...Double(range.upperBound), step: 1) {
@@ -595,17 +868,14 @@ private struct PresetEditor: View {
                 } maximumValueLabel: {
                     Text("Smallest").font(.caption2)
                 }
+                Text("Constant quality: every file looks the same, but the size depends on the footage. Press Measure on a row for a real figure.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-        case .bitrate:
-            Picker("Bitrate", selection: $preset.videoBitrate) {
-                ForEach(["20M", "12M", "8M", "5M", "3M", "1M"], id: \.self) { Text($0).tag($0) }
-            }
-        case .prores:
+        } else if preset.includeVideo, Encoders.video(preset.videoCodec)?.quality == .prores {
             Picker("Profile", selection: $preset.proresProfile) {
                 ForEach(Encoders.proresProfiles, id: \.0) { Text($0.1).tag($0.0) }
             }
-        default:
-            EmptyView()
         }
     }
 }

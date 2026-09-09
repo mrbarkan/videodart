@@ -117,11 +117,22 @@ enum FFmpeg {
             a += ["-c:v", "copy"]
         } else {
             a += ["-c:v", preset.videoCodec]
-            switch Encoders.video(preset.videoCodec)?.quality {
-            case .crf: a += ["-crf", String(preset.crf)]
-            case .bitrate: a += ["-b:v", preset.videoBitrate]
-            case .prores: a += ["-profile:v", String(preset.proresProfile)]
-            default: break
+            let style = Encoders.video(preset.videoCodec)?.quality
+            if style == .prores {
+                a += ["-profile:v", String(preset.proresProfile)]
+            } else if style == .crf, preset.qualityMode == .crf {
+                a += ["-crf", String(preset.crf)]
+                // VP9 reads -crf only when the bitrate is pinned to 0; left alone it
+                // treats the CRF as a cap and targets its own default rate instead.
+                if preset.videoCodec == "libvpx-vp9" { a += ["-b:v", "0"] }
+            } else if style == .crf || style == .bitrate {
+                let kbps = preset.videoKbps(forDuration: effectiveDuration(job))
+                a += ["-b:v", "\(kbps)k"]
+                if preset.qualityMode == .targetSize {
+                    // A target is a promise about the whole file, so cap the peaks: one
+                    // busy scene at 3x the average is how a 25 MB target lands at 40 MB.
+                    a += ["-maxrate", "\(kbps * 3 / 2)k", "-bufsize", "\(kbps * 2)k"]
+                }
             }
             var filters: [String] = []
             if preset.maxHeight > 0 {
@@ -141,13 +152,22 @@ enum FFmpeg {
         } else {
             a += ["-c:a", preset.audioCodec]
             if Encoders.audio(preset.audioCodec)?.takesBitrate == true {
-                a += ["-b:a", preset.audioBitrate]
+                a += ["-b:a", "\(preset.audioKbps)k"]
             }
         }
 
         a += tokenize(preset.extraFlags)
         a.append(output.path)
         return a
+    }
+
+    /// How long the output runs: the trimmed span if there is one, otherwise whatever is
+    /// left of the source after the start point. Target-size mode divides a byte budget by
+    /// this, so a wrong answer here is a file that misses its target.
+    static func effectiveDuration(_ job: ConvertJob) -> Double? {
+        if let span = trimDuration(job) { return span }
+        guard let total = job.sourceDuration else { return nil }
+        return max(0, total - (Timecode.seconds(job.trimStart) ?? 0))
     }
 
     /// The trimmed span, or nil when the job runs to the end of the source.
@@ -293,6 +313,97 @@ enum FFmpeg {
             message = String(message[colon.upperBound...])
         }
         return message.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Inspecting a source
+
+    /// What the staging list needs to know about a dropped file. ffprobe is not available
+    /// — the static build the installer ships has no such binary — so this reads the
+    /// banner ffmpeg prints when asked to open a file with no output.
+    struct MediaProbe: Sendable, Hashable {
+        var duration: Double?
+        var bytes: Int64 = 0
+        var width: Int?
+        var height: Int?
+
+        var resolution: String? {
+            guard let width, let height else { return nil }
+            return "\(width)×\(height)"
+        }
+    }
+
+    static func inspect(_ url: URL) async -> MediaProbe {
+        var probe = MediaProbe()
+        probe.bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+
+        guard let path = executablePath else { return probe }
+        let banner: String = await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: path)
+                // No output file: ffmpeg describes the input, complains, and exits non-zero.
+                // That complaint is the cheapest metadata read available without ffprobe.
+                p.arguments = ["-hide_banner", "-nostdin", "-i", url.path]
+                p.environment = environment
+                let err = Pipe()
+                p.standardError = err
+                p.standardOutput = Pipe()
+                guard (try? p.run()) != nil else { return cont.resume(returning: "") }
+                let data = (try? err.fileHandleForReading.readToEnd()) ?? Data()
+                p.waitUntilExit()
+                cont.resume(returning: String(decoding: data, as: UTF8.self))
+            }
+        }
+
+        for line in banner.split(whereSeparator: \.isNewline) {
+            let text = String(line)
+            if probe.duration == nil, let seconds = duration(in: text) { probe.duration = seconds }
+            // "Stream #0:0: Video: h264 …, 1920x1080 [SAR 1:1 DAR 16:9], 5000 kb/s"
+            if probe.width == nil, text.contains("Video:"),
+               let r = text.range(of: #"\b(\d{2,5})x(\d{2,5})\b"#, options: .regularExpression) {
+                let pair = text[r].split(separator: "x").compactMap { Int($0) }
+                if pair.count == 2 { probe.width = pair[0]; probe.height = pair[1] }
+            }
+        }
+        return probe
+    }
+
+    /// Encodes a few seconds from the middle of the clip with the job's real settings and
+    /// scales the result up. CRF cannot be predicted from the numbers — it spends whatever
+    /// the picture needs — so the only honest estimate is a small real encode. The middle
+    /// is used rather than the opening because titles and fades compress unrepresentatively.
+    static func sampleBytes(for job: ConvertJob, seconds: Double = 4) async -> Int64? {
+        guard let total = effectiveDuration(job), total > seconds * 1.5 else { return nil }
+
+        var sample = job
+        let start = (Timecode.seconds(job.trimStart) ?? 0) + (total - seconds) / 2
+        sample.trimStart = String(format: "%.3f", start)
+        sample.trimEnd = String(format: "%.3f", start + seconds)
+
+        let ext = job.preset.container == "original" ? job.source.pathExtension : job.preset.container
+        let output = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("videodart-sample-\(UUID().uuidString)")
+            .appendingPathExtension(ext)
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        guard let path = executablePath else { return nil }
+        let ok: Bool = await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: path)
+                p.arguments = arguments(for: sample, output: output)
+                p.environment = environment
+                p.standardOutput = Pipe()
+                p.standardError = Pipe()
+                guard (try? p.run()) != nil else { return cont.resume(returning: false) }
+                p.waitUntilExit()
+                cont.resume(returning: p.terminationStatus == 0)
+            }
+        }
+        guard ok,
+              let size = try? FileManager.default.attributesOfItem(atPath: output.path)[.size] as? Int64,
+              size > 0 else { return nil }
+        return Int64(Double(size) / seconds * total)
     }
 
     // MARK: - Input filtering

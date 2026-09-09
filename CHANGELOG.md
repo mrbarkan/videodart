@@ -3,6 +3,52 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.4.0 — unreleased
+
+Size becomes something you set, not something you find out afterwards.
+
+### Added
+
+- **Quality is now an explicit choice: Target size, Bitrate, or Quality (CRF).** It used
+  to be implied by the codec, which is how a hardware encoder ended up showing a CRF
+  slider it ignores. Target size takes a figure in MB and works the bitrate out per file
+  from that file's length, capping the peaks so one busy scene can't overshoot.
+- **Estimated output size, per output and totalled in the footer.** Exact arithmetic in
+  bitrate and target-size modes. CRF genuinely cannot be predicted — it spends whatever
+  the picture needs — so those rows get a **Measure** button that encodes a few seconds
+  from the middle of the clip and scales the result up. Measured at within 3% of a real
+  full encode in testing.
+- **One window.** Download and Convert are a segmented switch in the toolbar instead of
+  two separate windows, so conversion is visible instead of hidden in the Window menu.
+- **Several outputs per file.** Each file in the list has a **+**: add another output and
+  the same clip can go out as an MP4 and an MP3 in one pass.
+- **Multi-selection.** Select any number of output rows and the inspector edits all of
+  them at once; picking a preset from the toolbar applies it to the whole selection.
+- **Reset.** Puts finished conversions back in the list with their settings intact, for
+  when the answer to "how did that come out" is "smaller, please".
+- **Files are probed as they land** — duration, dimensions and size show on the row, and
+  every size estimate depends on that duration.
+- **A "Fit to 25 MB" preset**, since that is the shape of most "why won't this upload"
+  problems.
+
+### Fixed
+
+- **A hardware codec no longer shows a CRF slider.** Changing codecs now reconciles both
+  the quality mode and the container against what that encoder can actually do, so
+  neither can be left stranded on a setting that gets silently dropped at encode time.
+- **Built-in presets keep their identity between launches.** They were rebuilt with a
+  fresh UUID each time, so "remember the preset I last used" could never resolve one and
+  quietly reverted to the first in the list.
+- **The target-size and bitrate fields no longer print their value twice.** The
+  `TextField` that takes a number renders its first argument as a label, not as
+  placeholder text.
+
+### Changed
+
+- Video and audio bitrates are stored as plain kbit/s integers rather than ffmpeg rate
+  strings ("8M", "192k"). A `presets.json` written by 0.3.0 is migrated on read, keeping
+  its numbers and inferring the quality mode its codec implied.
+
 ## 0.3.0 (Beta), 2026-09-09
 
 First public release, and the one where the app stops being only a downloader.

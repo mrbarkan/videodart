@@ -176,8 +176,8 @@ enum SelfCheck {
         let output = URL(fileURLWithPath: "/tmp/clip.mp4")
 
         var h264 = ConvertPreset(name: "t")
-        h264.videoCodec = "libx264"; h264.crf = 20
-        h264.audioCodec = "aac"; h264.audioBitrate = "192k"
+        h264.videoCodec = "libx264"; h264.qualityMode = .crf; h264.crf = 20
+        h264.audioCodec = "aac"; h264.audioKbps = 192
         h264.container = "mp4"; h264.extraFlags = "-movflags +faststart"
         let plain = FFmpeg.arguments(for: ConvertJob(source: source, preset: h264), output: output)
         assert(plain.last == "/tmp/clip.mp4", "the output path must be the final argument")
@@ -194,10 +194,10 @@ enum SelfCheck {
         // The VideoToolbox encoders silently ignore -crf; sending it would ship a file at
         // whatever bitrate they picked while the UI claimed a quality had been chosen.
         var hardware = h264
-        hardware.videoCodec = "h264_videotoolbox"; hardware.videoBitrate = "8M"
+        hardware.videoCodec = "h264_videotoolbox"; hardware.qualityMode = .bitrate; hardware.videoKbps = 8000
         let hw = FFmpeg.arguments(for: ConvertJob(source: source, preset: hardware), output: output)
         assert(!hw.contains("-crf"), "a bitrate encoder must not be handed -crf")
-        assert(adjacent(hw, ["-b:v", "8M"]))
+        assert(adjacent(hw, ["-b:v", "8000k"]))
 
         var prores = h264
         prores.videoCodec = "prores_ks"; prores.proresProfile = 3; prores.container = "mov"
@@ -320,6 +320,140 @@ enum SelfCheck {
                == "Invalid data found when processing input", "the path is already on the row")
         assert(!FFmpeg.cleanError("").isEmpty, "a silent failure still needs a message")
 
+
+        // MARK: Quality modes — the size-led ones and what they emit
+        // A CRF-capable codec asked for a bitrate must stop emitting -crf entirely;
+        // sending both lets x264 quietly ignore the number the user actually set.
+        var rateMode = h264
+        rateMode.qualityMode = .bitrate
+        rateMode.videoKbps = 2500
+        let rated = FFmpeg.arguments(for: ConvertJob(source: source, preset: rateMode), output: output)
+        assert(adjacent(rated, ["-b:v", "2500k"]))
+        assert(!rated.contains("-crf"), "bitrate mode must not also send a CRF")
+        assert(!rated.contains("-maxrate"), "only a target budget needs its peaks capped")
+
+        var sized = h264
+        sized.qualityMode = .targetSize
+        sized.targetSizeMB = 25
+        sized.audioKbps = 128
+        // 25 MB over 100 s is 2000 kbit/s all in; 3% headroom then the audio comes off.
+        assert(sized.videoKbps(forDuration: 100) == Int(25 * 8000 / 100 * 0.97) - 128,
+               "got \(sized.videoKbps(forDuration: 100))")
+        assert(sized.videoKbps(forDuration: 100) > 1700 && sized.videoKbps(forDuration: 100) < 1950,
+               "a 25 MB / 100 s budget should land near 1.8 Mbit/s")
+        // A clip long enough to make the budget absurd must still produce a legal bitrate.
+        assert(sized.videoKbps(forDuration: 90_000) >= 64, "bitrate must never go to zero or negative")
+        assert(sized.videoKbps(forDuration: nil) == sized.videoKbps,
+               "with no duration there is nothing to divide, so fall back to the plain rate")
+
+        var sizedJob = ConvertJob(source: source, preset: sized)
+        sizedJob.sourceDuration = 100
+        let budgeted = FFmpeg.arguments(for: sizedJob, output: output)
+        assert(budgeted.contains("-maxrate") && budgeted.contains("-bufsize"),
+               "a target is a promise about the whole file; peaks must be capped")
+        assert(!budgeted.contains("-crf"))
+
+        // VP9 needs the bitrate pinned to zero for -crf to mean constant quality, and
+        // must NOT get that pin when it is being asked for a real bitrate.
+        var vp9 = h264
+        vp9.videoCodec = "libvpx-vp9"; vp9.container = "webm"; vp9.audioCodec = "libopus"
+        vp9.qualityMode = .crf
+        assert(adjacent(FFmpeg.arguments(for: ConvertJob(source: source, preset: vp9), output: output),
+                        ["-b:v", "0"]), "VP9 CRF needs -b:v 0 or it targets its own default rate")
+        vp9.qualityMode = .bitrate
+        vp9.videoKbps = 1500
+        assert(adjacent(FFmpeg.arguments(for: ConvertJob(source: source, preset: vp9), output: output),
+                        ["-b:v", "1500k"]), "VP9 in bitrate mode must not be pinned to 0")
+
+        // MARK: Size estimation
+        assert(rateMode.estimatedBytes(duration: 60, sourceBytes: nil, sourceDuration: nil)
+               == Int64((2500.0 + 192) * 1000 * 60 / 8), "bitrate mode is exact arithmetic")
+        assert(sized.estimatedBytes(duration: 60, sourceBytes: nil, sourceDuration: nil)
+               == 25_000_000, "target-size mode estimates the target itself")
+        assert(h264.estimatedBytes(duration: 60, sourceBytes: nil, sourceDuration: nil) == nil,
+               "CRF cannot be predicted — that nil is what puts a Measure button on the row")
+        assert(rateMode.estimatedBytes(duration: nil, sourceBytes: nil, sourceDuration: nil) == nil,
+               "no duration, no estimate")
+
+        var remuxOnly = h264
+        remuxOnly.videoCodec = Encoders.copyID
+        remuxOnly.audioCodec = Encoders.copyID
+        assert(remuxOnly.estimatedBytes(duration: 30, sourceBytes: 1000, sourceDuration: 60) == 500,
+               "a copy of half the clip is half the bytes")
+        assert(remuxOnly.estimatedBytes(duration: 120, sourceBytes: 1000, sourceDuration: 60) == 1000,
+               "an untrimmed copy is the whole source, never more")
+
+        // MARK: Which modes each codec can offer
+        assert(h264.availableQualityModes == [.targetSize, .bitrate, .crf])
+        assert(hardware.availableQualityModes == [.targetSize, .bitrate],
+               "the VideoToolbox encoders have no CRF to offer")
+        assert(prores.availableQualityModes.isEmpty, "ProRes takes a profile, not a rate")
+        assert(remux.availableQualityModes.isEmpty, "a copied stream has no quality to set")
+
+        // The remembered-preset lookup is by id, and built-ins are reconstructed every
+        // launch — a random id there means the setting never resolves and silently
+        // reverts to the first preset.
+        assert(ConvertPreset.stableID("H.264 MP4") == ConvertPreset.stableID("H.264 MP4"),
+               "a built-in id must not change between launches")
+        assert(ConvertPreset.stableID("H.264 MP4") != ConvertPreset.stableID("H.265 MP4"))
+        assert(Set(ConvertPreset.builtIns.map(\.id)).count == ConvertPreset.builtIns.count,
+               "two built-ins sharing an id would make one unpickable")
+
+        // MARK: Reconciling after a codec change
+        // Switching a CRF preset to a hardware encoder must not leave CRF selected: that
+        // encoder has no such flag, so the number the user set would be silently dropped.
+        var switched = h264
+        switched.videoCodec = "h264_videotoolbox"
+        let fixedMode = switched.reconciled()
+        assert(fixedMode.qualityMode == .bitrate,
+               "a codec with no CRF must not keep CRF selected, got \(fixedMode.qualityMode)")
+
+        // And switching to a codec that cannot live in the current container must move it.
+        var toVP9 = h264                       // container is mp4
+        toVP9.videoCodec = "libvpx-vp9"
+        toVP9.audioCodec = "libopus"
+        let fixedContainer = toVP9.reconciled()
+        assert(fixedContainer.allowedContainers.contains(fixedContainer.container),
+               "\(fixedContainer.container) is not muxable by VP9")
+        assert(fixedContainer.container == "webm", "got \(fixedContainer.container)")
+
+        // A preset that is already consistent must come back untouched, or every edit
+        // would quietly rewrite something the user chose.
+        assert(h264.reconciled() == h264, "reconciling a valid preset must change nothing")
+        assert(sized.reconciled().qualityMode == .targetSize, "a supported mode must survive")
+
+        // MARK: 0.3.0 presets.json — rates were strings, and there was no mode at all
+        assert(ConvertPreset.parseRate("8M") == 8000)
+        assert(ConvertPreset.parseRate("192k") == 192)
+        assert(ConvertPreset.parseRate("2500") == 2500)
+        assert(ConvertPreset.parseRate(nil) == nil)
+        assert(ConvertPreset.parseRate("") == nil)
+
+        let v030 = """
+        [{"id":"1B4E28BA-2FA1-11D2-883F-0016D3CCA427","name":"Old Hardware","isBuiltIn":false,
+        "videoCodec":"h264_videotoolbox","videoBitrate":"8M","audioCodec":"aac",
+        "audioBitrate":"256k","container":"mp4","crf":20}]
+        """
+        let migrated = try? JSONDecoder().decode([ConvertPreset].self, from: Data(v030.utf8))
+        assert(migrated?.first?.videoKbps == 8000, "an \"8M\" string must survive as 8000 kbit/s")
+        assert(migrated?.first?.audioKbps == 256, "got \(String(describing: migrated?.first?.audioKbps))")
+        assert(migrated?.first?.qualityMode == .bitrate,
+               "a 0.3.0 preset has no mode; it must be inferred from the codec, as that build did")
+
+        let v030crf = """
+        [{"id":"1B4E28BA-2FA1-11D2-883F-0016D3CCA428","name":"Old x264","videoCodec":"libx264",
+        "crf":18,"videoBitrate":"8M","audioBitrate":"192k","container":"mp4"}]
+        """
+        let migratedCRF = try? JSONDecoder().decode([ConvertPreset].self, from: Data(v030crf.utf8))
+        assert(migratedCRF?.first?.qualityMode == .crf, "a CRF codec infers CRF mode")
+        assert(migratedCRF?.first?.crf == 18, "and keeps the number it was set to")
+
+        // Round-tripping the new shape must not resurrect the legacy keys.
+        let reencoded = try! JSONEncoder().encode([rateMode])
+        assert(!String(decoding: reencoded, as: UTF8.self).contains("videoBitrate"),
+               "the 0.3.0 string keys are read-only; writing them again would be a second source of truth")
+        assert((try? JSONDecoder().decode([ConvertPreset].self, from: reencoded))?.first?.videoKbps == 2500)
+
         // MARK: Presets
         assert(FFmpeg.isMedia(URL(fileURLWithPath: "/tmp/a.mov")))
         assert(FFmpeg.isMedia(URL(fileURLWithPath: "/tmp/a.mp3")))
@@ -354,7 +488,7 @@ enum SelfCheck {
         let restored = try? JSONDecoder().decode([ConvertPreset].self, from: Data(legacy.utf8))
         assert(restored?.count == 1, "an older presets.json must still load")
         assert(restored?.first?.crf == 18, "existing values must survive")
-        assert(restored?.first?.audioBitrate == "192k", "a field added later falls back to its default")
+        assert(restored?.first?.audioKbps == 192, "a field added later falls back to its default")
     }
 }
 #endif

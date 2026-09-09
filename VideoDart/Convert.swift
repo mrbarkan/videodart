@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 // MARK: - Encoder catalogue
 
@@ -10,6 +11,22 @@ enum QualityStyle: String, Codable, Hashable {
     case crf        // -crf N
     case bitrate    // -b:v 8M — the VideoToolbox encoders take nothing else
     case prores     // -profile:v N
+}
+
+/// How *you* say what you want. Separate from `QualityStyle`, which is what the encoder
+/// accepts: the codec decides which of these are possible, you decide which you use.
+/// Conflating the two is why a hardware codec used to show a CRF slider it ignores.
+enum QualityMode: String, Codable, CaseIterable, Identifiable, Hashable {
+    case targetSize, bitrate, crf
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .targetSize: "Target size"
+        case .bitrate: "Bitrate"
+        case .crf: "Quality"
+        }
+    }
 }
 
 /// One row of the video codec picker. `id` is verbatim what follows `-c:v`.
@@ -100,14 +117,20 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
     var includeAudio = true
 
     var videoCodec = "libx264"
-    var crf = 20
-    var videoBitrate = "8M"      // only the .bitrate encoders read this
     var proresProfile = 3
     var maxHeight = 0            // 0 keeps the source height; never upscales
     var fps = 0.0                // 0 keeps the source rate
 
+    /// How the size/quality trade-off is expressed. `.targetSize` and `.bitrate` are
+    /// predictable before encoding; `.crf` is not, which is the whole reason it is a
+    /// choice rather than the only option.
+    var qualityMode: QualityMode = .crf
+    var crf = 20
+    var videoKbps = 8000
+    var targetSizeMB = 25.0
+
     var audioCodec = "aac"
-    var audioBitrate = "192k"
+    var audioKbps = 192
 
     var container = "mp4"        // or "original" to keep the source extension
     var extraFlags = ""          // raw ffmpeg arguments, inserted before the output path
@@ -119,6 +142,55 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
             && (!includeAudio || audioCodec == Encoders.copyID)
     }
 
+    var audioTakesBitrate: Bool {
+        includeAudio && audioCodec != Encoders.copyID
+            && Encoders.audio(audioCodec)?.takesBitrate == true
+    }
+
+    /// Which ways of asking make sense for the chosen codec. ProRes and a copied stream
+    /// take neither a bitrate nor a CRF, so they offer nothing; the VideoToolbox encoders
+    /// have no CRF at all, so they offer the two size-led modes only.
+    var availableQualityModes: [QualityMode] {
+        guard includeVideo, let encoder = Encoders.video(videoCodec) else { return [] }
+        switch encoder.quality {
+        case .crf: return [.targetSize, .bitrate, .crf]
+        case .bitrate: return [.targetSize, .bitrate]
+        case .prores, .none: return []
+        }
+    }
+
+    /// The video bitrate this preset asks for on a clip of the given length. Only
+    /// target-size mode depends on the duration — the others are already absolute.
+    func videoKbps(forDuration seconds: Double?) -> Int {
+        guard qualityMode == .targetSize, let seconds, seconds > 0 else { return videoKbps }
+        // MB here is what Finder shows: 10^6 bytes, so 1 MB is 8000 kbit.
+        let budget = targetSizeMB * 8000 / seconds
+        // Container overhead is small but real, and overshooting a target is worse than
+        // undershooting it, so hand back 3% before splitting the rest with the audio.
+        return max(64, Int(budget * 0.97) - (audioTakesBitrate ? audioKbps : 0))
+    }
+
+    /// What the output should weigh, when that is knowable without encoding it.
+    /// `.crf` deliberately returns nil: only a real sample encode can answer it.
+    func estimatedBytes(duration: Double?, sourceBytes: Int64?, sourceDuration: Double?) -> Int64? {
+        guard let duration, duration > 0 else { return nil }
+        if isCopyOnly {
+            // Copying rewrites the same packets, so the source's own rate is exact.
+            guard let sourceBytes, let sourceDuration, sourceDuration > 0 else { return nil }
+            return Int64(Double(sourceBytes) * min(1, duration / sourceDuration))
+        }
+        let audio = audioTakesBitrate ? Double(audioKbps) : 0
+        if !includeVideo {
+            guard audio > 0 else { return nil }   // FLAC/WAV have no bitrate to reason from
+            return Int64(audio * 1000 * duration / 8)
+        }
+        switch qualityMode {
+        case .targetSize: return Int64(targetSizeMB * 1_000_000)
+        case .bitrate: return Int64((Double(videoKbps) + audio) * 1000 * duration / 8)
+        case .crf: return nil
+        }
+    }
+
     var summary: String {
         var parts: [String] = []
         if includeVideo {
@@ -127,9 +199,14 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
             } else {
                 var v = Encoders.video(videoCodec)?.label ?? videoCodec
                 switch Encoders.video(videoCodec)?.quality {
-                case .crf: v += " CRF \(crf)"
-                case .bitrate: v += " \(videoBitrate)"
-                case .prores: v += " \(Encoders.proresProfiles.first { $0.0 == proresProfile }?.1 ?? "")"
+                case .prores:
+                    v += " " + (Encoders.proresProfiles.first { $0.0 == proresProfile }?.1 ?? "")
+                case .crf, .bitrate:
+                    switch qualityMode {
+                    case .crf: v += " CRF \(crf)"
+                    case .bitrate: v += " " + Self.rateLabel(videoKbps)
+                    case .targetSize: v += " " + Self.sizeLabel(targetSizeMB)
+                    }
                 default: break
                 }
                 parts.append(v)
@@ -144,13 +221,25 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
                 parts.append("Copy audio")
             } else {
                 let a = Encoders.audio(audioCodec)
-                parts.append((a?.label ?? audioCodec) + (a?.takesBitrate == true ? " \(audioBitrate)" : ""))
+                parts.append((a?.label ?? audioCodec)
+                             + (a?.takesBitrate == true ? " \(audioKbps)k" : ""))
             }
         } else {
             parts.append("No audio")
         }
         parts.append(container == "original" ? "Same container" : container.uppercased())
         return parts.joined(separator: " · ")
+    }
+
+    /// 2500 -> "2.5 Mbps", 800 -> "800 kbps"
+    static func rateLabel(_ kbps: Int) -> String {
+        kbps >= 1000
+            ? String(format: "%g Mbps", (Double(kbps) / 1000 * 10).rounded() / 10)
+            : "\(kbps) kbps"
+    }
+
+    static func sizeLabel(_ mb: Double) -> String {
+        String(format: mb < 10 ? "%.1f MB" : "%.0f MB", mb)
     }
 
     /// 30.0 -> "30", 29.97 -> "29.97"
@@ -166,6 +255,40 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         return ["original", "mp4", "mkv", "mov"]
     }
 
+    /// Snaps the container and quality mode back to something the chosen codecs can
+    /// actually do. Changing the codec strands both: H.265 with WebM still selected won't
+    /// mux, and a hardware encoder with CRF still selected silently ignores the number.
+    ///
+    /// A pure function applied wherever the preset is written, rather than an .onChange in
+    /// the editor: mutating a binding from a change observed on that same binding is a
+    /// read-write cycle, and SwiftUI logs it as one.
+    func reconciled() -> ConvertPreset {
+        var fixed = self
+        let containers = fixed.allowedContainers
+        if !containers.contains(fixed.container), let first = containers.first {
+            fixed.container = first
+        }
+        let modes = fixed.availableQualityModes
+        if !modes.isEmpty, !modes.contains(fixed.qualityMode) {
+            fixed.qualityMode = modes.contains(.bitrate) ? .bitrate : modes[0]
+        }
+        return fixed
+    }
+
+    // MARK: Codable
+
+    /// Written by hand because the two bitrates changed shape in 0.4.0 — they were
+    /// ffmpeg rate strings ("8M", "192k") and are now plain kbit/s integers. The old keys
+    /// are still read so a presets.json saved by 0.3.0 keeps its numbers instead of
+    /// silently falling back to the defaults.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, isBuiltIn, includeVideo, includeAudio
+        case videoCodec, proresProfile, maxHeight, fps
+        case qualityMode, crf, videoKbps, targetSizeMB
+        case audioCodec, audioKbps, container, extraFlags
+        case videoBitrate, audioBitrate          // 0.3.0 only, migration in
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
@@ -174,15 +297,57 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         includeVideo = try c.decodeIfPresent(Bool.self, forKey: .includeVideo) ?? true
         includeAudio = try c.decodeIfPresent(Bool.self, forKey: .includeAudio) ?? true
         videoCodec = try c.decodeIfPresent(String.self, forKey: .videoCodec) ?? "libx264"
-        crf = try c.decodeIfPresent(Int.self, forKey: .crf) ?? 20
-        videoBitrate = try c.decodeIfPresent(String.self, forKey: .videoBitrate) ?? "8M"
         proresProfile = try c.decodeIfPresent(Int.self, forKey: .proresProfile) ?? 3
         maxHeight = try c.decodeIfPresent(Int.self, forKey: .maxHeight) ?? 0
         fps = try c.decodeIfPresent(Double.self, forKey: .fps) ?? 0
+        crf = try c.decodeIfPresent(Int.self, forKey: .crf) ?? 20
+        targetSizeMB = try c.decodeIfPresent(Double.self, forKey: .targetSizeMB) ?? 25
         audioCodec = try c.decodeIfPresent(String.self, forKey: .audioCodec) ?? "aac"
-        audioBitrate = try c.decodeIfPresent(String.self, forKey: .audioBitrate) ?? "192k"
         container = try c.decodeIfPresent(String.self, forKey: .container) ?? "mp4"
         extraFlags = try c.decodeIfPresent(String.self, forKey: .extraFlags) ?? ""
+
+        videoKbps = try c.decodeIfPresent(Int.self, forKey: .videoKbps)
+            ?? Self.parseRate(try c.decodeIfPresent(String.self, forKey: .videoBitrate)) ?? 8000
+        audioKbps = try c.decodeIfPresent(Int.self, forKey: .audioKbps)
+            ?? Self.parseRate(try c.decodeIfPresent(String.self, forKey: .audioBitrate)) ?? 192
+
+        // A 0.3.0 preset predates the mode entirely: infer it from the codec, which is
+        // exactly what that build did implicitly.
+        if let saved = try c.decodeIfPresent(QualityMode.self, forKey: .qualityMode) {
+            qualityMode = saved
+        } else {
+            qualityMode = Encoders.video(videoCodec)?.quality == .bitrate ? .bitrate : .crf
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(isBuiltIn, forKey: .isBuiltIn)
+        try c.encode(includeVideo, forKey: .includeVideo)
+        try c.encode(includeAudio, forKey: .includeAudio)
+        try c.encode(videoCodec, forKey: .videoCodec)
+        try c.encode(proresProfile, forKey: .proresProfile)
+        try c.encode(maxHeight, forKey: .maxHeight)
+        try c.encode(fps, forKey: .fps)
+        try c.encode(qualityMode, forKey: .qualityMode)
+        try c.encode(crf, forKey: .crf)
+        try c.encode(videoKbps, forKey: .videoKbps)
+        try c.encode(targetSizeMB, forKey: .targetSizeMB)
+        try c.encode(audioCodec, forKey: .audioCodec)
+        try c.encode(audioKbps, forKey: .audioKbps)
+        try c.encode(container, forKey: .container)
+        try c.encode(extraFlags, forKey: .extraFlags)
+    }
+
+    /// "8M" -> 8000, "192k" -> 192, "2500" -> 2500. Only ever fed 0.3.0's own output.
+    static func parseRate(_ text: String?) -> Int? {
+        guard let text, !text.isEmpty else { return nil }
+        let digits = text.filter { $0.isNumber || $0 == "." }
+        guard let value = Double(digits) else { return nil }
+        let suffix = text.uppercased().last
+        return suffix == "M" ? Int(value * 1000) : Int(value)
     }
 
     init(name: String, isBuiltIn: Bool = false) {
@@ -199,23 +364,23 @@ extension ConvertPreset {
     /// actually ask a converter for.
     static let builtIns: [ConvertPreset] = [
         make("H.264 MP4") {
-            $0.videoCodec = "libx264"; $0.crf = 20
-            $0.audioCodec = "aac"; $0.audioBitrate = "192k"
+            $0.videoCodec = "libx264"; $0.qualityMode = .crf; $0.crf = 20
+            $0.audioCodec = "aac"; $0.audioKbps = 192
             $0.container = "mp4"; $0.extraFlags = "-preset medium -movflags +faststart"
         },
         make("H.264 MP4 (Small)") {
-            $0.videoCodec = "libx264"; $0.crf = 26; $0.maxHeight = 720
-            $0.audioCodec = "aac"; $0.audioBitrate = "128k"
+            $0.videoCodec = "libx264"; $0.qualityMode = .crf; $0.crf = 26; $0.maxHeight = 720
+            $0.audioCodec = "aac"; $0.audioKbps = 128
             $0.container = "mp4"; $0.extraFlags = "-preset medium -movflags +faststart"
         },
         make("H.264 (Hardware, Fast)") {
-            $0.videoCodec = "h264_videotoolbox"; $0.videoBitrate = "8M"
-            $0.audioCodec = "aac"; $0.audioBitrate = "192k"
+            $0.videoCodec = "h264_videotoolbox"; $0.qualityMode = .bitrate; $0.videoKbps = 8000
+            $0.audioCodec = "aac"; $0.audioKbps = 192
             $0.container = "mp4"; $0.extraFlags = "-movflags +faststart"
         },
         make("H.265 MP4") {
-            $0.videoCodec = "libx265"; $0.crf = 24
-            $0.audioCodec = "aac"; $0.audioBitrate = "192k"
+            $0.videoCodec = "libx265"; $0.qualityMode = .crf; $0.crf = 24
+            $0.audioCodec = "aac"; $0.audioKbps = 192
             // Without the hvc1 tag QuickTime and Photos refuse an otherwise valid file.
             $0.container = "mp4"; $0.extraFlags = "-preset medium -tag:v hvc1 -movflags +faststart"
         },
@@ -225,25 +390,30 @@ extension ConvertPreset {
             $0.container = "mov"
         },
         make("WebM VP9") {
-            $0.videoCodec = "libvpx-vp9"; $0.crf = 31
-            $0.audioCodec = "libopus"; $0.audioBitrate = "128k"
+            $0.videoCodec = "libvpx-vp9"; $0.qualityMode = .crf; $0.crf = 31
+            $0.audioCodec = "libopus"; $0.audioKbps = 128
             // VP9 reads -crf only when the bitrate is pinned to 0; otherwise it is a cap.
             $0.container = "webm"; $0.extraFlags = "-b:v 0 -row-mt 1"
         },
         make("Audio: MP3 320") {
             $0.includeVideo = false
-            $0.audioCodec = "libmp3lame"; $0.audioBitrate = "320k"
+            $0.audioCodec = "libmp3lame"; $0.audioKbps = 320
             $0.container = "mp3"
         },
         make("Audio: M4A 256") {
             $0.includeVideo = false
-            $0.audioCodec = "aac"; $0.audioBitrate = "256k"
+            $0.audioCodec = "aac"; $0.audioKbps = 256
             $0.container = "m4a"
         },
         make("Audio: WAV") {
             $0.includeVideo = false
             $0.audioCodec = "pcm_s16le"
             $0.container = "wav"
+        },
+        make("Fit to 25 MB") {
+            $0.videoCodec = "libx264"; $0.qualityMode = .targetSize; $0.targetSizeMB = 25
+            $0.audioCodec = "aac"; $0.audioKbps = 128
+            $0.container = "mp4"; $0.extraFlags = "-preset medium -movflags +faststart"
         },
         make("Remux to MP4 (no re-encode)") {
             $0.videoCodec = Encoders.copyID
@@ -259,8 +429,18 @@ extension ConvertPreset {
 
     private static func make(_ name: String, _ body: (inout ConvertPreset) -> Void) -> ConvertPreset {
         var p = ConvertPreset(name: name, isBuiltIn: true)
+        p.id = stableID(name)
         body(&p)
         return p
+    }
+
+    /// Built-ins are rebuilt from source on every launch, so a fresh `UUID()` would be a
+    /// different id each time and "remember the last preset I used" could never resolve
+    /// one — it would silently fall back to the first built-in forever. Derived from the
+    /// name so the id survives relaunches without anything being written to disk.
+    static func stableID(_ name: String) -> UUID {
+        var bytes = [UInt8](Insecure.MD5.hash(data: Data(name.utf8)))
+        return bytes.withUnsafeMutableBufferPointer { NSUUID(uuidBytes: $0.baseAddress!) as UUID }
     }
 }
 
@@ -327,6 +507,8 @@ struct ConvertJob: Identifiable, Hashable {
     var id = UUID()
     var source: URL
     var preset: ConvertPreset
+    var sourceDuration: Double?
+    var sourceBytes: Int64?
     var destinationDir: String?   // nil writes beside the source
     var trimStart: String = ""    // timecode text exactly as typed; "" means from the top
     var trimEnd: String = ""      // "" means to the end
