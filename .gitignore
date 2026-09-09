@@ -1,0 +1,23 @@
+# Xcode / SwiftPM build output
+DerivedData/
+.build/
+build/
+build-rel/
+dist/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.moved-aside
+
+# macOS
+.DS_Store
+
+# The .xcodeproj is hand-maintained and committed, so the project builds with stock
+# `xcodebuild`. Ignore only the per-user scheme/state inside it:
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+# Claude Code local state
+.claude/
+.superpowers/

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Only the keys Xcode cannot generate. GENERATE_INFOPLIST_FILE stays on and merges the
+  usual CFBundle* entries into this file at build time — INFOPLIST_KEY_ build settings
+  are limited to a fixed set Apple knows about, and Sparkle's two are not in it.
+-->
+<plist version="1.0">
+<dict>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/mrbarkan/videodart/main/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>Y95K8qPB+GjLM3ssC6l1jOFZqpETG3aVC3D1btrbmd8=</string>
+</dict>
+</plist>
