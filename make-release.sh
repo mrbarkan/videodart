@@ -115,8 +115,12 @@ echo "dist/VideoDart.dmg  <- send this one"
 echo "  size: $(du -h dist/VideoDart.dmg | awk '{print $1}')"
 echo "  gatekeeper: $(spctl -a -vv -t open --context context:primary-signature dist/VideoDart.dmg 2>&1 | grep source=)"
 echo "  sha256: $(shasum -a 256 dist/VideoDart.dmg | awk '{print $1}')"
+# The release notes are the newest CHANGELOG section, so the GitHub release and the
+# changelog cannot drift apart by being written twice.
+awk '/^## /{n++} n==1' CHANGELOG.md | tail -n +2 > dist/release-notes.md
+
 echo
-echo "appcast.xml written. To publish the update:"
-echo "  gh release create $TAG dist/VideoDart.dmg --repo $REPO --title \"$LABEL\" $PRERELEASE --notes-file CHANGELOG-latest.md"
+echo "appcast.xml and dist/release-notes.md written. To publish the update:"
+echo "  gh release create $TAG dist/VideoDart.dmg --repo $REPO --title \"$LABEL\" $PRERELEASE --notes-file dist/release-notes.md"
 echo "  git add appcast.xml && git commit -m \"Release $VERSION\" && git push"
 echo "Existing copies see the update once appcast.xml is on the default branch."
