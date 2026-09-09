@@ -1,0 +1,17 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <title>VideoDart</title>
+    <item>
+      <title>0.3.0 Beta</title>
+      <pubDate>Wed, 09 Sep 2026 17:34:12 -0300</pubDate>
+      <sparkle:version>202609092032</sparkle:version>
+      <sparkle:shortVersionString>0.3.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure
+        url="https://github.com/mrbarkan/videodart/releases/download/v0.3.0-beta.1/VideoDart.dmg"
+        type="application/octet-stream"
+        sparkle:edSignature="xkXFFoKDcVu0rw+NNVgEpAh7YOefmQ+5FXPKZSbmtfhYosl2EEZrhpuH3+8YKvoELQpsqjq2FDp4fyqfgaufCw==" length="2870954" />
+    </item>
+  </channel>
+</rss>
