@@ -3,6 +3,16 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.4.1 (Beta), 2026-09-15
+
+Ready for macOS 27 Golden Gate.
+
+### Changed
+
+- **Built for macOS 27.** VideoDart is now built with the macOS 27 SDK.
+- **Updater on macOS 27.** In-app updates move to Sparkle 2.10.0, the release
+  with Sparkle's macOS 27 fixes.
+
 ## 0.4.0 (Beta), 2026-09-15
 
 Size becomes something you set, not something you find out afterwards.
