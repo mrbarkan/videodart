@@ -273,10 +273,11 @@ enum YTDLP {
     /// Errors a browser sign-in would fix. A regex rather than a list of literals because
     /// every site spells it differently — YouTube says "Sign in", Instagram says both
     /// "log in" and "logged-in", and a missed spelling means the sheet offers the user
-    /// no way out of a wall they could clear by picking a browser.
+    /// no way out of a wall they could clear by picking a browser. "registered users" is
+    /// the default wording of yt-dlp's raise_login_required, so it covers many extractors.
     static func isAuthError(_ message: String) -> Bool {
         message.range(
-            of: #"(?i)(sign ?in|log ?in|logged.?in|confirm your age|cookies|private video|members.only|not a bot)"#,
+            of: #"(?i)(sign ?in|log ?in|logged.?in|registered users|confirm your age|cookies|private video|members.only|not a bot)"#,
             options: .regularExpression) != nil
     }
 

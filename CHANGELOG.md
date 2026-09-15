@@ -3,7 +3,7 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
-## 0.4.0 — unreleased
+## 0.4.0 (Beta), 2026-09-15
 
 Size becomes something you set, not something you find out afterwards.
 
@@ -42,6 +42,9 @@ Size becomes something you set, not something you find out afterwards.
 - **The target-size and bitrate fields no longer print their value twice.** The
   `TextField` that takes a number renders its first argument as a label, not as
   placeholder text.
+- **Followers-only Instagram posts now offer sign-in.** "Only available for registered
+  users who follow this account" matched none of the sign-in phrasings, so the sheet
+  showed a dead-end error instead of the browser picker that fixes it.
 
 ### Changed
 

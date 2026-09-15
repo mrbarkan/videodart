@@ -100,6 +100,16 @@ enum SelfCheck {
                + "accessible in your browser without being logged-in.", "got: \(reel)")
         assert(YTDLP.isAuthError(reel), "hyphenated \"logged-in\" must still offer the fix")
 
+        // Followers-only posts use yt-dlp's default login-required wording, no "log in" at all.
+        let followers = YTDLP.cleanError("""
+        ERROR: [Instagram] DdH9q19J5VJg9uPUZ_jDGI0TP2fzwkHxA748fI0: This content is only \
+        available for registered users who follow this account. Use --cookies-from-browser \
+        or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ
+        """)
+        assert(followers == "This content is only available for registered users who follow this account.",
+               "got: \(followers)")
+        assert(YTDLP.isAuthError(followers), "\"registered users\" must offer the sign-in fix")
+
         assert(YTDLP.displayTitle("DHC August Video_02.mp4") == "DHC August Video_02")
         assert(YTDLP.displayTitle("Talk: v1.0 of the thing") == "Talk: v1.0 of the thing",
                "a dot that is not a media extension must survive")
