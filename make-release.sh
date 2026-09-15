@@ -70,7 +70,9 @@ STAGE=$(mktemp -d)
 cp -R dist/VideoDart.app "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 rm -f dist/VideoDart.dmg
-hdiutil create -volname "VideoDart" -srcfolder "$STAGE" -format UDZO -quiet dist/VideoDart.dmg
+# Not -quiet: that also swallows hdiutil's error, and under set -e the script then dies
+# with no message at all.
+hdiutil create -volname "VideoDart" -srcfolder "$STAGE" -format UDZO dist/VideoDart.dmg
 rm -rf "$STAGE"
 codesign --force --timestamp --sign "$ID" dist/VideoDart.dmg
 xcrun notarytool submit dist/VideoDart.dmg --keychain-profile notarytool --wait
