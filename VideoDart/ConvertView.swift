@@ -13,6 +13,18 @@ struct StagedOutput: Identifiable, Hashable {
     /// because a stale measurement is worse than no measurement.
     var measured: Int64?
     var measuring = false
+    /// The settings an automatic measure last ran for. Compared rather than reset, so no
+    /// edit path can forget to clear it, and a sample that fails isn't retried forever.
+    var autoMeasuredFor: Settings?
+
+    /// Everything a measurement depends on besides the source itself.
+    struct Settings: Hashable {
+        var preset: ConvertPreset
+        var trimStart: String
+        var trimEnd: String
+    }
+
+    var settings: Settings { Settings(preset: preset, trimStart: trimStart, trimEnd: trimEnd) }
 
     var trimIsValid: Bool {
         (trimStart.isEmpty || Timecode.seconds(trimStart) != nil)
@@ -81,6 +93,41 @@ struct ConvertView: View {
         ffmpegInstalled && !allOutputs.isEmpty && allOutputs.allSatisfy { $0.output.trimIsValid }
     }
 
+    /// Short clips are measured without being asked: the sample is four seconds whatever
+    /// the length, and under five minutes nobody has queued a batch big enough to mind.
+    private static let autoMeasureLimit: Double = 5 * 60
+
+    private var pendingAutoMeasure: [UUID] {
+        allOutputs.compactMap { file, output in
+            let preset = output.preset
+            guard output.measured == nil, output.autoMeasuredFor != output.settings,
+                  output.trimIsValid, preset.qualityMode == .crf,
+                  !preset.availableQualityModes.isEmpty,       // video is actually encoded
+                  let duration = FFmpeg.effectiveDuration(job(for: file, output)),
+                  duration < Self.autoMeasureLimit else { return nil }
+            return output.id
+        }
+    }
+
+    /// Re-evaluated when the pending set changes or a measure finishes. The key changing
+    /// also cancels the sleep, which is the debounce while someone types a trim point.
+    private struct AutoMeasureKey: Equatable {
+        var pending: [UUID]
+        var busy: Bool
+    }
+
+    private var autoMeasureKey: AutoMeasureKey {
+        AutoMeasureKey(pending: pendingAutoMeasure,
+                       busy: allOutputs.contains { $0.output.measuring })
+    }
+
+    /// One at a time: twenty dropped files must not become twenty parallel encodes.
+    private func autoMeasureNext() {
+        guard !autoMeasureKey.busy, let id = pendingAutoMeasure.first,
+              let file = staged.first(where: { $0.outputs.contains { $0.id == id } }) else { return }
+        measure(file.id, id, auto: true)
+    }
+
     /// Total of every estimate we have. Outputs still waiting on a Measure are excluded,
     /// so the number is flagged as a floor rather than quietly counting them as zero.
     private var totalEstimate: (bytes: Int64, complete: Bool) {
@@ -144,6 +191,10 @@ struct ConvertView: View {
                 _ = adopt(paths.split(separator: "\n").map { URL(fileURLWithPath: String($0)) })
             }
             #endif
+        }
+        .task(id: autoMeasureKey) {
+            guard (try? await Task.sleep(for: .milliseconds(600))) != nil else { return }
+            autoMeasureNext()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             ffmpegInstalled = FFmpeg.isInstalled
@@ -387,16 +438,21 @@ struct ConvertView: View {
                                             sourceDuration: file.probe?.duration)
     }
 
-    private func measure(_ fileID: UUID, _ outputID: UUID) {
+    private func measure(_ fileID: UUID, _ outputID: UUID, auto: Bool = false) {
         guard let f = staged.firstIndex(where: { $0.id == fileID }),
               let o = staged[f].outputs.firstIndex(where: { $0.id == outputID }) else { return }
+        let settings = staged[f].outputs[o].settings
         staged[f].outputs[o].measuring = true
+        if auto { staged[f].outputs[o].autoMeasuredFor = settings }
         let job = job(for: staged[f], staged[f].outputs[o])
         Task {
             let bytes = await FFmpeg.sampleBytes(for: job)
             guard let f = staged.firstIndex(where: { $0.id == fileID }),
                   let o = staged[f].outputs.firstIndex(where: { $0.id == outputID }) else { return }
             staged[f].outputs[o].measuring = false
+            // Settings edited mid-sample: the number describes something no longer asked
+            // for. Dropping it puts the row back in the auto queue with the new settings.
+            guard staged[f].outputs[o].settings == settings else { return }
             staged[f].outputs[o].measured = bytes
         }
     }

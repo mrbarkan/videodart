@@ -13,7 +13,12 @@ final class Navigator {
         var symbol: String { self == .download ? "arrow.down.circle" : "wand.and.rays" }
     }
 
+    #if DEBUG
+    // VD_STAGE fills the Convert pane, which is useless if the app opens on Download.
+    var pane: Pane = ProcessInfo.processInfo.environment["VD_STAGE"] == nil ? .download : .convert
+    #else
     var pane: Pane = .download
+    #endif
 }
 
 struct ContentView: View {
