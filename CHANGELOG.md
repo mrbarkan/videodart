@@ -3,6 +3,29 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.5.0 (Beta), 2026-09-25
+
+Delivery specs ("under 20 MB, no audio, VBR two-pass") and a simple grade.
+
+### Added
+
+- **Size limit.** Bitrate and Quality modes take an optional cap in MB. In Bitrate
+  mode a clip too long for the asked rate drops to whatever fits, so "35 Mbps, but under
+  20 MB" does what it says. With VP9 in Quality mode the cap becomes constrained quality.
+- **Two-pass encoding** for H.264, H.265 and VP9. The first pass reads the clip to plan
+  the bitrate, the second encodes it; each is half the progress bar. H.264 and H.265 offer
+  it in Bitrate and Target size modes, since x264 refuses two-pass with CRF.
+- **Color.** Brightness, contrast and saturation sliders, and a `.cube` / `.3dl` LUT
+  applied to the export. The LUT is applied first, so a log-to-Rec.709 LUT normalises the
+  footage and the sliders then adjust the result. Saved with the preset.
+- **Automatic Measure.** Quality-mode outputs under five minutes are measured as soon as
+  the file is read, one at a time, instead of waiting for the Measure button.
+
+### Fixed
+
+- **A measurement that finished after its settings changed is thrown away** rather than
+  shown against settings it never measured.
+
 ## 0.4.1 (Beta), 2026-09-15
 
 Ready for macOS 27 Golden Gate.
