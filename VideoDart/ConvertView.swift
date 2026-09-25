@@ -57,16 +57,71 @@ enum ByteCount {
     }
 }
 
+/// What the staging list and the inspector share. An @Observable object rather than
+/// @State because the .inspector content is hosted apart from ConvertView's body: SwiftUI
+/// never re-ran it when @State here changed, so the editor went stale — sliders snapped
+/// back, and switching the mode left the old mode's controls on screen. Observation
+/// tracks a read wherever it happens, so the editor reading this object redraws with it.
+@MainActor @Observable
+final class Staging {
+    var files: [StagedFile] = []
+    var selection: Set<UUID> = []
+    /// The preset new outputs get, and what the inspector edits when no output is selected.
+    var workingPreset = ConvertPreset.builtIns[0]
+
+    private var selectedOutputs: [(file: StagedFile, output: StagedOutput)] {
+        files.flatMap { file in file.outputs.map { (file, $0) } }
+            .filter { selection.contains($0.output.id) }
+    }
+
+    /// Reads the first selected output and writes to every selected one, so editing a
+    /// control with six rows selected sets all six. With no output selected it edits the
+    /// preset that newly added outputs will get.
+    ///
+    /// "No output selected", not "nothing selected": rows in the Converting section are
+    /// selectable too, and keying the write on the raw selection while the read keyed on
+    /// outputs sent every edit to nowhere while one of those rows was selected.
+    var editedPreset: ConvertPreset {
+        get { selectedOutputs.first?.output.preset ?? workingPreset }
+        set {
+            let fixed = newValue.reconciled()
+            var wrote = false
+            for f in files.indices {
+                for o in files[f].outputs.indices where selection.contains(files[f].outputs[o].id) {
+                    files[f].outputs[o].preset = fixed
+                    files[f].outputs[o].measured = nil    // it described the old settings
+                    wrote = true
+                }
+            }
+            if !wrote { workingPreset = fixed }
+        }
+    }
+
+    var scope: String {
+        switch selectedOutputs.count {
+        case 0: "Settings for files you add"
+        case 1: selectedOutputs[0].file.url.lastPathComponent
+        case let n: "Editing \(n) outputs"
+        }
+    }
+}
+
 struct ConvertView: View {
     @Environment(ConvertQueue.self) private var queue
     @Environment(PresetStore.self) private var presets
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    @State private var staged: [StagedFile] = []
-    @State private var selection: Set<UUID> = []
-    /// The preset new outputs get, and what the inspector edits when nothing is selected.
-    @State private var workingPreset = ConvertPreset.builtIns[0]
+    @State private var staging = Staging()
+    private var staged: [StagedFile] {
+        get { staging.files } nonmutating set { staging.files = newValue }
+    }
+    private var selection: Set<UUID> {
+        get { staging.selection } nonmutating set { staging.selection = newValue }
+    }
+    private var workingPreset: ConvertPreset {
+        get { staging.workingPreset } nonmutating set { staging.workingPreset = newValue }
+    }
     @State private var pickedPresetID = ConvertPreset.builtIns[0].id
     @State private var isDropTarget = false
     @State private var showInspector = true
@@ -83,10 +138,6 @@ struct ConvertView: View {
 
     private var allOutputs: [(file: StagedFile, output: StagedOutput)] {
         staged.flatMap { file in file.outputs.map { (file, $0) } }
-    }
-
-    private var selectedOutputs: [(file: StagedFile, output: StagedOutput)] {
-        allOutputs.filter { selection.contains($0.output.id) }
     }
 
     private var canConvert: Bool {
@@ -148,7 +199,7 @@ struct ConvertView: View {
         }
         .toolbar { toolbar }
         .inspector(isPresented: $showInspector) {
-            PresetEditor(preset: editedPreset, scope: inspectorScope)
+            PresetEditor(staging: staging)
                 .inspectorColumnWidth(min: 280, ideal: 320, max: 400)
         }
         .dropDestination(for: URL.self) { urls, _ in
@@ -175,7 +226,7 @@ struct ConvertView: View {
             rememberedPreset = id.uuidString
             // Picking a preset with rows selected is how you say "these files, this
             // preset" — the whole point of being able to select more than one.
-            if selection.isEmpty { workingPreset = picked } else { apply(picked) }
+            staging.editedPreset = picked
         }
         .task {
             if let saved = UUID(uuidString: rememberedPreset),
@@ -203,35 +254,6 @@ struct ConvertView: View {
 
     // MARK: - Inspector plumbing
 
-    private var inspectorScope: String {
-        switch selectedOutputs.count {
-        case 0: "Settings for files you add"
-        case 1: selectedOutputs[0].file.url.lastPathComponent
-        case let n: "Editing \(n) outputs"
-        }
-    }
-
-    /// Reads the first selected output and writes to every selected one, so editing a
-    /// control with six rows selected sets all six. With nothing selected it edits the
-    /// preset that newly added outputs will get.
-    private var editedPreset: Binding<ConvertPreset> {
-        Binding(
-            get: { selectedOutputs.first?.output.preset ?? workingPreset },
-            set: { updated in
-                let fixed = updated.reconciled()
-                if selection.isEmpty { workingPreset = fixed } else { apply(fixed) }
-            })
-    }
-
-    private func apply(_ preset: ConvertPreset) {
-        for f in staged.indices {
-            for o in staged[f].outputs.indices where selection.contains(staged[f].outputs[o].id) {
-                staged[f].outputs[o].preset = preset
-                staged[f].outputs[o].measured = nil    // it described the old settings
-            }
-        }
-    }
-
     // MARK: - Chrome
 
     @ToolbarContentBuilder
@@ -258,7 +280,7 @@ struct ConvertView: View {
                 Button("Save as Preset…") { beginSavePreset() }
                 if let current = presets.custom.first(where: { $0.id == pickedPresetID }) {
                     Button("Update “\(current.name)”") {
-                        var updated = editedPreset.wrappedValue
+                        var updated = staging.editedPreset
                         updated.id = current.id
                         updated.name = current.name
                         presets.save(updated)
@@ -300,8 +322,8 @@ struct ConvertView: View {
                     .adaptiveGlass(prominent: true)
             }
         } else {
-            List(selection: $selection) {
-                ForEach($staged) { $file in
+            List(selection: $staging.selection) {
+                ForEach($staging.files) { $file in
                     Section {
                         ForEach($file.outputs) { $output in
                             OutputRow(output: $output,
@@ -555,12 +577,12 @@ struct ConvertView: View {
     }
 
     private func beginSavePreset() {
-        newPresetName = editedPreset.wrappedValue.name + " Copy"
+        newPresetName = staging.editedPreset.name + " Copy"
         savingPreset = true
     }
 
     private func commitPreset() {
-        var fresh = editedPreset.wrappedValue
+        var fresh = staging.editedPreset
         fresh.id = UUID()
         fresh.name = newPresetName.trimmingCharacters(in: .whitespaces)
         presets.save(fresh)
@@ -791,9 +813,16 @@ private struct ConvertRow: View {
 /// The full ffmpeg controls. Every picker is filtered against what the resolved ffmpeg
 /// actually supports, so a preset can never name an encoder this build lacks.
 private struct PresetEditor: View {
-    @Binding var preset: ConvertPreset
-    let scope: String
-    @FocusState private var editingFlags: Bool
+    /// Read directly rather than through a Binding handed in: the inspector is hosted
+    /// apart from ConvertView and never re-ran when it changed, and a @Binding answers
+    /// from the value it was last given. Reading the object is what Observation tracks.
+    @Bindable var staging: Staging
+    private var preset: ConvertPreset {
+        get { staging.editedPreset } nonmutating set { staging.editedPreset = newValue }
+    }
+    /// Nothing is focused on open: the first text field would otherwise take the cursor.
+    @FocusState private var focus: Field?
+    private enum Field { case sizeLimit, flags }
 
     private static let heights = [(0, "Keep original"), (2160, "2160p"), (1440, "1440p"),
                                   (1080, "1080p"), (720, "720p"), (480, "480p"), (360, "360p")]
@@ -803,7 +832,7 @@ private struct PresetEditor: View {
     var body: some View {
         Form {
             Section {
-                Text(scope)
+                Text(staging.scope)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -812,17 +841,17 @@ private struct PresetEditor: View {
             }
 
             Section("Video") {
-                Toggle("Include video", isOn: $preset.includeVideo)
+                Toggle("Include video", isOn: $staging.editedPreset.includeVideo)
                 if preset.includeVideo {
-                    Picker("Codec", selection: $preset.videoCodec) {
+                    Picker("Codec", selection: $staging.editedPreset.videoCodec) {
                         ForEach(Encoders.availableVideo) { Text($0.label).tag($0.id) }
                     }
                     quality
                     if preset.videoCodec != Encoders.copyID {
-                        Picker("Resolution", selection: $preset.maxHeight) {
+                        Picker("Resolution", selection: $staging.editedPreset.maxHeight) {
                             ForEach(Self.heights, id: \.0) { Text($0.1).tag($0.0) }
                         }
-                        Picker("Frame rate", selection: $preset.fps) {
+                        Picker("Frame rate", selection: $staging.editedPreset.fps) {
                             ForEach(Self.rates, id: \.0) { Text($0.1).tag($0.0) }
                         }
                     }
@@ -832,13 +861,13 @@ private struct PresetEditor: View {
             if preset.includeVideo, preset.videoCodec != Encoders.copyID { color }
 
             Section("Audio") {
-                Toggle("Include audio", isOn: $preset.includeAudio)
+                Toggle("Include audio", isOn: $staging.editedPreset.includeAudio)
                 if preset.includeAudio {
-                    Picker("Codec", selection: $preset.audioCodec) {
+                    Picker("Codec", selection: $staging.editedPreset.audioCodec) {
                         ForEach(Encoders.availableAudio) { Text($0.label).tag($0.id) }
                     }
                     if Encoders.audio(preset.audioCodec)?.takesBitrate == true {
-                        Picker("Bitrate", selection: $preset.audioKbps) {
+                        Picker("Bitrate", selection: $staging.editedPreset.audioKbps) {
                             ForEach([320, 256, 192, 160, 128, 96], id: \.self) {
                                 Text("\($0) kbps").tag($0)
                             }
@@ -848,15 +877,15 @@ private struct PresetEditor: View {
             }
 
             Section {
-                Picker("Container", selection: $preset.container) {
+                Picker("Container", selection: $staging.editedPreset.container) {
                     ForEach(preset.allowedContainers, id: \.self) {
                         Text($0 == "original" ? "Same as source" : $0.uppercased()).tag($0)
                     }
                 }
-                TextField("Extra flags", text: $preset.extraFlags, prompt: Text("None"))
+                TextField("Extra flags", text: $staging.editedPreset.extraFlags, prompt: Text("None"))
                     .font(.system(.body, design: .monospaced))
                     .help("Passed to ffmpeg verbatim, e.g. -preset slow -movflags +faststart")
-                    .focused($editingFlags)
+                    .focused($focus, equals: .flags)
             } footer: {
                 if preset.isCopyOnly {
                     Text("Streams are copied, not re-encoded — fast and lossless. Trim points snap to the nearest keyframe.")
@@ -867,14 +896,14 @@ private struct PresetEditor: View {
             }
         }
         .formStyle(.grouped)
-        .task { editingFlags = false }
+        .task { focus = nil }
     }
 
     private var color: some View {
         Section {
-            adjust("Brightness", $preset.brightness, -0.5...0.5)
-            adjust("Contrast", $preset.contrast, 0.5...1.5)
-            adjust("Saturation", $preset.saturation, 0...2)
+            adjust("Brightness", $staging.editedPreset.brightness, -0.5...0.5)
+            adjust("Contrast", $staging.editedPreset.contrast, 0.5...1.5)
+            adjust("Saturation", $staging.editedPreset.saturation, 0...2)
             LabeledContent("LUT") {
                 HStack(spacing: 6) {
                     Text(preset.lutPath.isEmpty ? "None" : URL(fileURLWithPath: preset.lutPath).lastPathComponent)
@@ -928,7 +957,7 @@ private struct PresetEditor: View {
     private var quality: some View {
         let modes = preset.availableQualityModes
         if !modes.isEmpty {
-            Picker("Set by", selection: $preset.qualityMode) {
+            Picker("Set by", selection: $staging.editedPreset.qualityMode) {
                 ForEach(modes) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
@@ -937,7 +966,7 @@ private struct PresetEditor: View {
             case .targetSize:
                 LabeledContent("Target") {
                     HStack(spacing: 4) {
-                        TextField("Target", value: $preset.targetSizeMB,
+                        TextField("Target", value: $staging.editedPreset.targetSizeMB,
                                   format: .number.precision(.fractionLength(0...1)))
                             .labelsHidden()
                             .frame(width: 58)
@@ -953,7 +982,7 @@ private struct PresetEditor: View {
             case .bitrate:
                 LabeledContent("Video") {
                     HStack(spacing: 4) {
-                        TextField("Video bitrate", value: $preset.videoKbps, format: .number)
+                        TextField("Video bitrate", value: $staging.editedPreset.videoKbps, format: .number)
                             .labelsHidden()
                             .frame(width: 66)
                             .multilineTextAlignment(.trailing)
@@ -961,7 +990,7 @@ private struct PresetEditor: View {
                         Text("kbps")
                     }
                 }
-                Picker("Common", selection: $preset.videoKbps) {
+                Picker("Common", selection: $staging.editedPreset.videoKbps) {
                     ForEach([20000, 12000, 8000, 5000, 3000, 1500, 800], id: \.self) {
                         Text(ConvertPreset.rateLabel($0)).tag($0)
                     }
@@ -998,17 +1027,18 @@ private struct PresetEditor: View {
                             .frame(width: 58)
                             .multilineTextAlignment(.trailing)
                             .monospacedDigit()
+                            .focused($focus, equals: .sizeLimit)
                         Text("MB")
                     }
                 }
                 .help("Lowers the bitrate on long clips so the file stays under this size")
             }
             if preset.supportsTwoPass {
-                Toggle("Two-pass", isOn: $preset.twoPass)
+                Toggle("Two-pass", isOn: $staging.editedPreset.twoPass)
                     .help("Reads the clip once to plan, then encodes — about twice as long, better quality at the same size")
             }
         } else if preset.includeVideo, Encoders.video(preset.videoCodec)?.quality == .prores {
-            Picker("Profile", selection: $preset.proresProfile) {
+            Picker("Profile", selection: $staging.editedPreset.proresProfile) {
                 ForEach(Encoders.proresProfiles, id: \.0) { Text($0.1).tag($0.0) }
             }
         }

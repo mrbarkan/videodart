@@ -3,6 +3,19 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.5.1 (Beta), 2026-09-25
+
+### Fixed
+
+- **Convert settings stopped updating on screen.** Changes were saved, but the settings
+  panel kept showing the old values: the Quality slider snapped back when dragged, and
+  switching between Target size, Bitrate and Quality left the old controls showing. Broken
+  in 0.4.1 too.
+- **Edits went nowhere while a finished conversion was selected.** With a row in the
+  Converting section selected, the panel showed the default settings but saved every
+  change to no output at all. Those edits now go to the default settings.
+- **The Size limit field no longer takes the text cursor** when the Convert pane opens.
+
 ## 0.5.0 (Beta), 2026-09-25
 
 Delivery specs ("under 20 MB, no audio, VBR two-pass") and a simple grade.
