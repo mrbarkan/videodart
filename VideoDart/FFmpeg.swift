@@ -122,17 +122,33 @@ enum FFmpeg {
                 a += ["-profile:v", String(preset.proresProfile)]
             } else if style == .crf, preset.qualityMode == .crf {
                 a += ["-crf", String(preset.crf)]
-                // VP9 reads -crf only when the bitrate is pinned to 0; left alone it
-                // treats the CRF as a cap and targets its own default rate instead.
-                if preset.videoCodec == "libvpx-vp9" { a += ["-b:v", "0"] }
+                let cap = preset.sizeCapKbps(forDuration: effectiveDuration(job))
+                if preset.videoCodec == "libvpx-vp9" {
+                    // VP9 reads -crf only when the bitrate is pinned to 0; left alone it
+                    // treats the CRF as a cap and targets its own default rate instead.
+                    // Which is exactly what a size cap wants: constrained quality.
+                    a += ["-b:v", cap.map { "\($0)k" } ?? "0"]
+                } else if let cap {
+                    // ponytail: a VBV ceiling bounds the peaks, not the file; CRF can
+                    // still land over on long flat clips. Bitrate mode is exact.
+                    a += ["-maxrate", "\(cap)k", "-bufsize", "\(cap * 2)k"]
+                }
             } else if style == .crf || style == .bitrate {
                 let kbps = preset.videoKbps(forDuration: effectiveDuration(job))
                 a += ["-b:v", "\(kbps)k"]
-                if preset.qualityMode == .targetSize {
+                if preset.qualityMode == .targetSize
+                    || preset.sizeCapKbps(forDuration: effectiveDuration(job)) != nil {
                     // A target is a promise about the whole file, so cap the peaks: one
                     // busy scene at 3x the average is how a 25 MB target lands at 40 MB.
                     a += ["-maxrate", "\(kbps * 3 / 2)k", "-bufsize", "\(kbps * 2)k"]
                 }
+            }
+            if job.pass > 0 {
+                let log = passLog(for: job.id).path
+                // libx265 ignores -pass; its stats go through its own parameter string.
+                a += preset.videoCodec == "libx265"
+                    ? ["-x265-params", "pass=\(job.pass):stats=\(log)"]
+                    : ["-pass", String(job.pass), "-passlogfile", log]
             }
             var filters: [String] = []
             if preset.maxHeight > 0 {
@@ -141,12 +157,21 @@ enum FFmpeg {
                 // The comma is escaped because ffmpeg reads a bare one as a filter separator.
                 filters.append("scale=-2:min(ih\\,\(preset.maxHeight))")
             }
+            // After the scale, so the grade runs on the smaller frame; LUT before eq, so a
+            // log-to-Rec.709 LUT normalises first and the sliders adjust what it produced.
+            if !preset.lutPath.isEmpty {
+                filters.append("lut3d=file=" + filterEscape(preset.lutPath))
+            }
+            if preset.hasColorAdjustment {
+                filters.append(String(format: "eq=brightness=%.2f:contrast=%.2f:saturation=%.2f",
+                                      preset.brightness, preset.contrast, preset.saturation))
+            }
             if !filters.isEmpty { a += ["-vf", filters.joined(separator: ",")] }
             if preset.fps > 0 { a += ["-r", preset.formattedFPS] }
         }
 
-        if !preset.includeAudio {
-            a.append("-an")
+        if !preset.includeAudio || job.pass == 1 {
+            a.append("-an")                          // pass 1 only analyses the video
         } else if preset.audioCodec == Encoders.copyID {
             a += ["-c:a", "copy"]
         } else {
@@ -157,8 +182,34 @@ enum FFmpeg {
         }
 
         a += tokenize(preset.extraFlags)
-        a.append(output.path)
+        // Pass 1 writes only its stats log; the real output is pass 2's.
+        a += job.pass == 1 ? ["-f", "null", "/dev/null"] : [output.path]
         return a
+    }
+
+    /// Where a two-pass job keeps its stats. Encoders append their own suffixes
+    /// (x264 "-0.log" and ".mbtree", x265 ".cutree"), so cleanup goes by prefix.
+    static func passLog(for id: UUID) -> URL {
+        URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("videodart-pass-\(id.uuidString)")
+    }
+
+    static func removePassLogs(for id: UUID) {
+        let log = passLog(for: id)
+        let dir = log.deletingLastPathComponent()
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        where name.hasPrefix(log.lastPathComponent) {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name))
+        }
+    }
+
+    /// A path as a filter option value. ffmpeg unescapes twice — once splitting the graph
+    /// on , ; [ ], once splitting options on : — so a path with a colon or comma in it
+    /// needs both layers, or lut3d reads half a filename.
+    static func filterEscape(_ value: String) -> String {
+        func escape(_ s: String, _ special: Set<Character>) -> String {
+            String(s.flatMap { special.contains($0) ? ["\\", $0] : [$0] })
+        }
+        return escape(escape(value, ["\\", "'", ":"]), ["\\", "'", "[", "]", ",", ";"])
     }
 
     /// How long the output runs: the trimmed span if there is one, otherwise whatever is

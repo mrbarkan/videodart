@@ -118,9 +118,15 @@ final class ConvertQueue {
             // denominator is the span, not what ffmpeg reports for the input. When the
             // source was probed on drop this is already known before ffmpeg says a word.
             $0.duration = FFmpeg.effectiveDuration($0)
+            $0.pass = $0.preset.usesTwoPass ? 1 : 0
         }
-        logs[id] = []
+        run(id, output: output)
+    }
 
+    /// One ffmpeg process: the whole job, or one half of a two-pass one.
+    private func run(_ id: UUID, output: URL) {
+        guard let job = jobs.first(where: { $0.id == id }) else { return }
+        logs[id] = []
         do {
             let (process, events) = try FFmpeg.start(job, output: output)
             running = (id, process)
@@ -133,6 +139,7 @@ final class ConvertQueue {
         } catch {
             update(id) { $0.state = .failed; $0.error = error.localizedDescription }
             running = nil
+            FFmpeg.removePassLogs(for: id)
             pump()
         }
     }
@@ -147,7 +154,9 @@ final class ConvertQueue {
             update(id) {
                 guard $0.state == .converting else { return }
                 if let total = $0.duration, total > 0 {
-                    $0.progress = min(1, seconds / total)
+                    let fraction = min(1, seconds / total)
+                    // Each pass reads the whole clip, so each is half the bar.
+                    $0.progress = $0.pass == 0 ? fraction : (Double($0.pass - 1) + fraction) / 2
                 }
                 $0.speed = speed
                 $0.outputSize = size
@@ -159,6 +168,13 @@ final class ConvertQueue {
 
         case let .exited(code):
             running = nil
+            if code == 0, let job = jobs.first(where: { $0.id == id }),
+               job.state == .converting, job.pass == 1, let path = job.outputPath {
+                update(id) { $0.pass = 2 }
+                run(id, output: URL(fileURLWithPath: path))
+                return
+            }
+            FFmpeg.removePassLogs(for: id)
             let tail = (logs[id] ?? []).joined(separator: "\n")
             logs[id] = nil
             update(id) { job in

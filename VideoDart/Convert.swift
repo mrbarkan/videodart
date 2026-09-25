@@ -128,6 +128,18 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
     var crf = 20
     var videoKbps = 8000
     var targetSizeMB = 25.0
+    /// A ceiling on the bitrate and CRF modes: "35 Mbps, but under 20 MB". 0 is no cap.
+    /// Target-size mode has no use for it — its target already is the cap.
+    var maxSizeMB = 0.0
+    /// Honoured only where `supportsTwoPass` says ffmpeg can do it; otherwise ignored, so
+    /// switching codec and back doesn't lose the choice.
+    var twoPass = false
+
+    /// Neutral values emit no filter at all. `lutPath` is a .cube/.3dl file, "" for none.
+    var brightness = 0.0         // eq: -1...1, 0 is unchanged
+    var contrast = 1.0           // eq: 1 is unchanged
+    var saturation = 1.0         // eq: 1 is unchanged
+    var lutPath = ""
 
     var audioCodec = "aac"
     var audioKbps = 192
@@ -159,15 +171,42 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         }
     }
 
-    /// The video bitrate this preset asks for on a clip of the given length. Only
-    /// target-size mode depends on the duration — the others are already absolute.
+    /// The video bitrate this preset asks for on a clip of the given length. Target-size
+    /// mode depends on the duration; bitrate mode only when a size cap bites.
     func videoKbps(forDuration seconds: Double?) -> Int {
-        guard qualityMode == .targetSize, let seconds, seconds > 0 else { return videoKbps }
+        switch qualityMode {
+        case .targetSize: budgetKbps(targetSizeMB, seconds) ?? videoKbps
+        case .bitrate: min(videoKbps, sizeCapKbps(forDuration: seconds) ?? .max)
+        case .crf: videoKbps
+        }
+    }
+
+    /// The video rate that keeps the whole file under `maxSizeMB`, or nil when uncapped.
+    func sizeCapKbps(forDuration seconds: Double?) -> Int? {
+        qualityMode == .targetSize || maxSizeMB <= 0 ? nil : budgetKbps(maxSizeMB, seconds)
+    }
+
+    private func budgetKbps(_ mb: Double, _ seconds: Double?) -> Int? {
+        guard let seconds, seconds > 0 else { return nil }
         // MB here is what Finder shows: 10^6 bytes, so 1 MB is 8000 kbit.
-        let budget = targetSizeMB * 8000 / seconds
+        let budget = mb * 8000 / seconds
         // Container overhead is small but real, and overshooting a target is worse than
         // undershooting it, so hand back 3% before splitting the rest with the audio.
         return max(64, Int(budget * 0.97) - (audioTakesBitrate ? audioKbps : 0))
+    }
+
+    /// x264 refuses CRF with two passes outright ("CRF/CQP is incompatible with 2pass");
+    /// VP9 takes it as constrained quality. The hardware encoders and SVT-AV1 have no
+    /// multi-pass through ffmpeg at all.
+    var supportsTwoPass: Bool {
+        guard includeVideo, ["libx264", "libx265", "libvpx-vp9"].contains(videoCodec) else { return false }
+        return qualityMode != .crf || videoCodec == "libvpx-vp9"
+    }
+
+    var usesTwoPass: Bool { twoPass && supportsTwoPass }
+
+    var hasColorAdjustment: Bool {
+        brightness != 0 || contrast != 1 || saturation != 1
     }
 
     /// What the output should weigh, when that is knowable without encoding it.
@@ -186,7 +225,7 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         }
         switch qualityMode {
         case .targetSize: return Int64(targetSizeMB * 1_000_000)
-        case .bitrate: return Int64((Double(videoKbps) + audio) * 1000 * duration / 8)
+        case .bitrate: return Int64((Double(videoKbps(forDuration: duration)) + audio) * 1000 * duration / 8)
         case .crf: return nil
         }
     }
@@ -207,12 +246,18 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
                     case .bitrate: v += " " + Self.rateLabel(videoKbps)
                     case .targetSize: v += " " + Self.sizeLabel(targetSizeMB)
                     }
+                    if qualityMode != .targetSize, maxSizeMB > 0 { v += " ≤ " + Self.sizeLabel(maxSizeMB) }
+                    if usesTwoPass { v += " 2-pass" }
                 default: break
                 }
                 parts.append(v)
             }
             if maxHeight > 0 { parts.append("\(maxHeight)p") }
             if fps > 0 { parts.append("\(formattedFPS) fps") }
+            if videoCodec != Encoders.copyID {
+                if !lutPath.isEmpty { parts.append("LUT") }
+                if hasColorAdjustment { parts.append("Color") }
+            }
         } else {
             parts.append("No video")
         }
@@ -284,7 +329,8 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id, name, isBuiltIn, includeVideo, includeAudio
         case videoCodec, proresProfile, maxHeight, fps
-        case qualityMode, crf, videoKbps, targetSizeMB
+        case qualityMode, crf, videoKbps, targetSizeMB, maxSizeMB, twoPass
+        case brightness, contrast, saturation, lutPath
         case audioCodec, audioKbps, container, extraFlags
         case videoBitrate, audioBitrate          // 0.3.0 only, migration in
     }
@@ -302,6 +348,12 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         fps = try c.decodeIfPresent(Double.self, forKey: .fps) ?? 0
         crf = try c.decodeIfPresent(Int.self, forKey: .crf) ?? 20
         targetSizeMB = try c.decodeIfPresent(Double.self, forKey: .targetSizeMB) ?? 25
+        maxSizeMB = try c.decodeIfPresent(Double.self, forKey: .maxSizeMB) ?? 0
+        twoPass = try c.decodeIfPresent(Bool.self, forKey: .twoPass) ?? false
+        brightness = try c.decodeIfPresent(Double.self, forKey: .brightness) ?? 0
+        contrast = try c.decodeIfPresent(Double.self, forKey: .contrast) ?? 1
+        saturation = try c.decodeIfPresent(Double.self, forKey: .saturation) ?? 1
+        lutPath = try c.decodeIfPresent(String.self, forKey: .lutPath) ?? ""
         audioCodec = try c.decodeIfPresent(String.self, forKey: .audioCodec) ?? "aac"
         container = try c.decodeIfPresent(String.self, forKey: .container) ?? "mp4"
         extraFlags = try c.decodeIfPresent(String.self, forKey: .extraFlags) ?? ""
@@ -335,6 +387,12 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         try c.encode(crf, forKey: .crf)
         try c.encode(videoKbps, forKey: .videoKbps)
         try c.encode(targetSizeMB, forKey: .targetSizeMB)
+        try c.encode(maxSizeMB, forKey: .maxSizeMB)
+        try c.encode(twoPass, forKey: .twoPass)
+        try c.encode(brightness, forKey: .brightness)
+        try c.encode(contrast, forKey: .contrast)
+        try c.encode(saturation, forKey: .saturation)
+        try c.encode(lutPath, forKey: .lutPath)
         try c.encode(audioCodec, forKey: .audioCodec)
         try c.encode(audioKbps, forKey: .audioKbps)
         try c.encode(container, forKey: .container)
@@ -519,6 +577,7 @@ struct ConvertJob: Identifiable, Hashable {
     var speed: String = ""
     var outputSize: String = ""
     var outputPath: String?
+    var pass = 0                  // 0 is a single pass; 1 and 2 are the halves of a two-pass run
     var error: String?
     var details: String?
 

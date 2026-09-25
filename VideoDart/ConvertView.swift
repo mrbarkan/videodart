@@ -682,7 +682,8 @@ private struct ConvertRow: View {
     }
 
     private var detail: String {
-        [job.progress > 0 ? "\(Int(job.progress * 100))%" : "", job.outputSize, job.speed]
+        [job.pass > 0 ? "Pass \(job.pass) of 2" : "",
+         job.progress > 0 ? "\(Int(job.progress * 100))%" : "", job.pass == 1 ? "" : job.outputSize, job.speed]
             .filter { !$0.isEmpty }
             .joined(separator: "  ·  ")
     }
@@ -772,6 +773,8 @@ private struct PresetEditor: View {
                 }
             }
 
+            if preset.includeVideo, preset.videoCodec != Encoders.copyID { color }
+
             Section("Audio") {
                 Toggle("Include audio", isOn: $preset.includeAudio)
                 if preset.includeAudio {
@@ -809,6 +812,60 @@ private struct PresetEditor: View {
         }
         .formStyle(.grouped)
         .task { editingFlags = false }
+    }
+
+    private var color: some View {
+        Section {
+            adjust("Brightness", $preset.brightness, -0.5...0.5)
+            adjust("Contrast", $preset.contrast, 0.5...1.5)
+            adjust("Saturation", $preset.saturation, 0...2)
+            LabeledContent("LUT") {
+                HStack(spacing: 6) {
+                    Text(preset.lutPath.isEmpty ? "None" : URL(fileURLWithPath: preset.lutPath).lastPathComponent)
+                        .lineLimit(1).truncationMode(.middle)
+                        .foregroundStyle(.secondary)
+                        .help(preset.lutPath)
+                    if !preset.lutPath.isEmpty {
+                        Button("Remove LUT", systemImage: "xmark.circle.fill") { preset.lutPath = "" }
+                            .labelStyle(.iconOnly).buttonStyle(.borderless)
+                    }
+                    Button("Choose…") { chooseLUT() }
+                }
+            }
+        } header: {
+            HStack {
+                Text("Color")
+                Spacer()
+                if preset.hasColorAdjustment {
+                    Button("Reset") {
+                        preset.brightness = 0; preset.contrast = 1; preset.saturation = 1
+                    }
+                    .buttonStyle(.borderless).controlSize(.small)
+                }
+            }
+        }
+    }
+
+    /// Rounded to hundredths on the way in, so dragging back to the middle lands on
+    /// exactly 1.0 and the filter drops out instead of lingering as eq=contrast=1.00.
+    private func adjust(_ label: String, _ value: Binding<Double>, _ range: ClosedRange<Double>) -> some View {
+        LabeledContent(label) {
+            HStack(spacing: 6) {
+                Slider(value: Binding(get: { value.wrappedValue },
+                                      set: { value.wrappedValue = ($0 * 100).rounded() / 100 }),
+                       in: range)
+                    .labelsHidden()
+                Text(String(format: "%.2f", value.wrappedValue))
+                    .monospacedDigit().font(.caption)
+                    .frame(width: 34, alignment: .trailing)
+            }
+        }
+    }
+
+    private func chooseLUT() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = ["cube", "3dl"].compactMap { UTType(filenameExtension: $0) }
+        if panel.runModal() == .OK, let url = panel.url { preset.lutPath = url.path }
     }
 
     @ViewBuilder
@@ -871,6 +928,28 @@ private struct PresetEditor: View {
                 Text("Constant quality: every file looks the same, but the size depends on the footage. Press Measure on a row for a real figure.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if preset.qualityMode != .targetSize {
+                LabeledContent("Size limit") {
+                    HStack(spacing: 4) {
+                        TextField("Size limit",
+                                  value: Binding(get: { preset.maxSizeMB > 0 ? preset.maxSizeMB : nil },
+                                                 set: { preset.maxSizeMB = max(0, $0 ?? 0) }),
+                                  format: .number.precision(.fractionLength(0...1)),
+                                  prompt: Text("None"))
+                            .labelsHidden()
+                            .frame(width: 58)
+                            .multilineTextAlignment(.trailing)
+                            .monospacedDigit()
+                        Text("MB")
+                    }
+                }
+                .help("Lowers the bitrate on long clips so the file stays under this size")
+            }
+            if preset.supportsTwoPass {
+                Toggle("Two-pass", isOn: $preset.twoPass)
+                    .help("Reads the clip once to plan, then encodes — about twice as long, better quality at the same size")
             }
         } else if preset.includeVideo, Encoders.video(preset.videoCodec)?.quality == .prores {
             Picker("Profile", selection: $preset.proresProfile) {

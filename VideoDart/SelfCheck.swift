@@ -375,6 +375,70 @@ enum SelfCheck {
         assert(adjacent(FFmpeg.arguments(for: ConvertJob(source: source, preset: vp9), output: output),
                         ["-b:v", "1500k"]), "VP9 in bitrate mode must not be pinned to 0")
 
+        // MARK: Size cap — "35 Mbps, but under 20 MB"
+        var capped = h264
+        capped.qualityMode = .bitrate; capped.videoKbps = 35_000; capped.maxSizeMB = 20
+        capped.includeAudio = false
+        assert(capped.videoKbps(forDuration: 3) == 35_000, "a short clip fits at the asked rate")
+        assert(capped.videoKbps(forDuration: 60) == Int(20 * 8000 / 60 * 0.97),
+               "a long one drops to what fits, got \(capped.videoKbps(forDuration: 60))")
+        var cappedJob = ConvertJob(source: source, preset: capped)
+        cappedJob.sourceDuration = 60
+        let cappedArgs = FFmpeg.arguments(for: cappedJob, output: output)
+        assert(adjacent(cappedArgs, ["-b:v", "\(Int(20 * 8000 / 60 * 0.97))k"]))
+        assert(cappedArgs.contains("-maxrate"), "a size promise caps its peaks")
+        assert(capped.estimatedBytes(duration: 60, sourceBytes: nil, sourceDuration: nil)! <= 20_000_000)
+        var sizedCapped = sized
+        sizedCapped.maxSizeMB = 5
+        assert(sizedCapped.videoKbps(forDuration: 100) == sized.videoKbps(forDuration: 100),
+               "target-size mode already is a cap; a second one must not apply")
+
+        var vp9Capped = vp9
+        vp9Capped.qualityMode = .crf; vp9Capped.maxSizeMB = 20; vp9Capped.includeAudio = false
+        var vp9Job = ConvertJob(source: source, preset: vp9Capped)
+        vp9Job.sourceDuration = 60
+        assert(adjacent(FFmpeg.arguments(for: vp9Job, output: output), ["-b:v", "\(Int(20 * 8000 / 60 * 0.97))k"]),
+               "capped VP9 CRF is constrained quality: the cap goes in -b:v instead of 0")
+
+        // MARK: Two-pass
+        assert(!h264.supportsTwoPass, "x264 rejects CRF with two passes")
+        assert(rateMode.supportsTwoPass && sized.supportsTwoPass)
+        assert(vp9Capped.supportsTwoPass, "VP9 takes CRF two-pass as constrained quality")
+        assert(!hardware.supportsTwoPass, "VideoToolbox has no multi-pass")
+        var passJob = ConvertJob(source: source, preset: rateMode)
+        passJob.pass = 1
+        let pass1 = FFmpeg.arguments(for: passJob, output: output)
+        assert(adjacent(pass1, ["-pass", "1"]) && pass1.contains("-passlogfile"))
+        assert(pass1.contains("-an") && pass1.suffix(3) == ["-f", "null", "/dev/null"],
+               "pass 1 analyses video only and writes no file")
+        passJob.pass = 2
+        let pass2 = FFmpeg.arguments(for: passJob, output: output)
+        assert(adjacent(pass2, ["-pass", "2"]) && pass2.last == output.path && !pass2.contains("-an"))
+        assert(!FFmpeg.arguments(for: ConvertJob(source: source, preset: rateMode), output: output)
+            .contains("-pass"), "a single-pass job must not mention passes")
+        var x265 = rateMode
+        x265.videoCodec = "libx265"
+        var x265Job = ConvertJob(source: source, preset: x265)
+        x265Job.pass = 2
+        let x265Args = FFmpeg.arguments(for: x265Job, output: output)
+        assert(!x265Args.contains("-pass"), "libx265 ignores -pass")
+        assert(x265Args.contains { $0.hasPrefix("pass=2:stats=") })
+
+        // MARK: Color
+        assert(!FFmpeg.arguments(for: ConvertJob(source: source, preset: h264), output: output).contains("-vf"),
+               "neutral color settings must emit no filter")
+        var graded = scaled
+        graded.contrast = 1.1; graded.lutPath = "/tmp/a,b: c.cube"
+        let gradedArgs = FFmpeg.arguments(for: ConvertJob(source: source, preset: graded), output: output)
+        let vf = gradedArgs[gradedArgs.firstIndex(of: "-vf")! + 1]
+        assert(vf.hasPrefix("scale=") && vf.contains(#",lut3d=file=/tmp/a\,b\\: c.cube,eq="#), vf)
+        assert(vf.hasSuffix("eq=brightness=0.00:contrast=1.10:saturation=1.00"), vf)
+        assert(FFmpeg.filterEscape("it's") == #"it\\\'s"#, FFmpeg.filterEscape("it's"))
+        var gradedCopy = graded
+        gradedCopy.videoCodec = Encoders.copyID
+        assert(!FFmpeg.arguments(for: ConvertJob(source: source, preset: gradedCopy), output: output)
+            .contains("-vf"), "a copied stream cannot be filtered")
+
         // MARK: Size estimation
         assert(rateMode.estimatedBytes(duration: 60, sourceBytes: nil, sourceDuration: nil)
                == Int64((2500.0 + 192) * 1000 * 60 / 8), "bitrate mode is exact arithmetic")
@@ -499,6 +563,14 @@ enum SelfCheck {
         assert(restored?.count == 1, "an older presets.json must still load")
         assert(restored?.first?.crf == 18, "existing values must survive")
         assert(restored?.first?.audioKbps == 192, "a field added later falls back to its default")
+        assert(restored?.first?.maxSizeMB == 0 && restored?.first?.twoPass == false
+               && restored?.first?.contrast == 1 && restored?.first?.saturation == 1
+               && restored?.first?.lutPath == "", "0.4 presets predate size caps, passes and color")
+
+        var roundGraded = graded
+        roundGraded.twoPass = true; roundGraded.maxSizeMB = 20
+        let gradedRound = try? JSONDecoder().decode(ConvertPreset.self, from: JSONEncoder().encode(roundGraded))
+        assert(gradedRound == roundGraded, "every new field must survive a save")
     }
 }
 #endif
