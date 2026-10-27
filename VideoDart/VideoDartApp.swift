@@ -4,8 +4,18 @@ import Sparkle
 /// Sparkle's updater, plus the one piece of state a menu item needs: whether a check is
 /// possible right now. ponytail: one small observable instead of Sparkle's sample
 /// view-model and view pair.
+/// Betas are feed entries tagged `<sparkle:channel>beta</sparkle:channel>`; Sparkle
+/// offers them only to an updater that names the channel. Off by default, so a copy gets
+/// stable releases unless its owner opts in under Settings ▸ Advanced.
+private final class ChannelDelegate: NSObject, SPUUpdaterDelegate {
+    func allowedChannels(for updater: SPUUpdater) -> Set<String> {
+        UserDefaults.standard.bool(forKey: Prefs.Key.betaUpdates) ? ["beta"] : []
+    }
+}
+
 @MainActor @Observable
 final class Updater {
+    @ObservationIgnored private let channels = ChannelDelegate()
     @ObservationIgnored private let controller: SPUStandardUpdaterController
     @ObservationIgnored private var observation: NSKeyValueObservation?
     var canCheck = false
@@ -14,7 +24,7 @@ final class Updater {
         // startingUpdater: true schedules the background check the feed's interval asks
         // for; the menu item is only the manual path.
         controller = SPUStandardUpdaterController(startingUpdater: true,
-                                                  updaterDelegate: nil,
+                                                  updaterDelegate: channels,
                                                   userDriverDelegate: nil)
         // The change payload rather than the updater itself: reading the property back
         // off the main actor is exactly what Swift 6 rejects here.

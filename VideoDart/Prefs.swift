@@ -23,6 +23,7 @@ enum Prefs {
         /// converter is expected to do; a path overrides that for every job.
         static let convertDir = "convertDir"
         static let convertPreset = "convertPreset"
+        static let betaUpdates = "betaUpdates"
     }
 
     static let browsers = ["safari", "chrome", "brave", "firefox", "edge", "chromium", "vivaldi", "opera"]
@@ -45,6 +46,7 @@ enum Prefs {
             Key.watchClipboard: true,
             Key.convertDir: "",
             Key.convertPreset: "",
+            Key.betaUpdates: false,
         ])
     }
 

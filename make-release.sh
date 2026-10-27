@@ -84,10 +84,23 @@ xcrun stapler staple dist/VideoDart.dmg
 SIGN="./build/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
 ENCLOSURE=$("$SIGN" dist/VideoDart.dmg)
 
-# Only the newest item: Sparkle picks the best entry in the feed, and one release is the
-# only thing this script knows about. Written to the repo root because SUFeedURL points
-# at raw.githubusercontent.com — committing it is what publishes the update.
-cat > appcast.xml <<XML
+# At most two entries: the newest stable release, offered to every copy, and the newest
+# beta, on Sparkle's "beta" channel so only copies with "Get beta versions" on see it.
+# A beta keeps the stable entry beside it; a stable release replaces both, since every
+# beta before it is older and Sparkle offers the newest entry a copy is allowed.
+# Written to the repo root because SUFeedURL points at raw.githubusercontent.com —
+# committing it is what publishes the update.
+if [ -n "$PRERELEASE" ]; then
+  CHANNEL="      <sparkle:channel>beta</sparkle:channel>"
+  STABLE=$(awk '/<item>/ { buf = ""; inside = 1 }
+                inside { buf = buf $0 "\n" }
+                /<\/item>/ { inside = 0; if (buf !~ /sparkle:channel>beta</) printf "%s", buf }' appcast.xml 2>/dev/null)
+else
+  CHANNEL=""
+  STABLE=""
+fi
+{
+  cat <<XML
 <?xml version="1.0" standalone="yes"?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
@@ -98,14 +111,21 @@ cat > appcast.xml <<XML
       <sparkle:version>$BUILD</sparkle:version>
       <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+XML
+  if [ -n "$CHANNEL" ]; then echo "$CHANNEL"; fi
+  cat <<XML
       <enclosure
         url="https://github.com/$REPO/releases/download/$TAG/VideoDart.dmg"
         type="application/octet-stream"
         $ENCLOSURE />
     </item>
+XML
+  if [ -n "$STABLE" ]; then printf "%s\n" "$STABLE"; fi
+  cat <<XML
   </channel>
 </rss>
 XML
+} > appcast.xml
 
 echo
 echo "dist/VideoDart.app"

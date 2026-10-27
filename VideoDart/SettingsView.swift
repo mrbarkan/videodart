@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage(Prefs.Key.rateLimit) private var rateLimit = ""
     @AppStorage(Prefs.Key.useArchive) private var useArchive = false
     @AppStorage(Prefs.Key.watchClipboard) private var watchClipboard = true
+    @AppStorage(Prefs.Key.betaUpdates) private var betaUpdates = false
 
     @State private var version = "…"
     // The first text field took focus on open, so Filename sat selected and one stray
@@ -187,6 +188,14 @@ struct SettingsView: View {
                 }
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                Toggle("Get beta versions", isOn: $betaUpdates)
+            } footer: {
+                Text("Betas arrive sooner and may have rough edges. Turning this off doesn’t move you back to an older version — you stay on the one you have until a newer stable release.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)

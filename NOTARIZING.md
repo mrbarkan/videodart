@@ -15,6 +15,10 @@ Existing copies check `appcast.xml` on the default branch, so nothing is offered
 anyone until that commit is pushed. Order matters: upload the release asset first, or
 the first person to check will follow a link to a file that is not there yet.
 
+A tag containing `-beta` (or `-rc`, `-alpha`) makes a beta: a GitHub pre-release, and a
+feed entry on Sparkle's `beta` channel that only copies with "Get beta versions" on are
+offered. The stable entry stays in the feed beside it. A stable release replaces both.
+
 The version you pass becomes `CFBundleShortVersionString`. The build number Sparkle
 actually compares is a UTC timestamp the script generates, so there is no counter to
 remember to bump and no way to ship two builds that look equal.
