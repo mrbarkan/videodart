@@ -96,8 +96,11 @@ enum FFmpeg {
 
     // MARK: - Arguments
 
-    static func arguments(for job: ConvertJob, output: URL) -> [String] {
+    /// `budgetDuration` stands in for the job's own length when sizing the bitrate: a
+    /// Measure sample is a few seconds of a longer clip, and its budget is the clip's.
+    static func arguments(for job: ConvertJob, output: URL, budgetDuration: Double? = nil) -> [String] {
         let preset = job.preset
+        let budget = budgetDuration ?? effectiveDuration(job)
         var a = ["-hide_banner",
                  // Without -nostdin ffmpeg grabs the shared terminal input and a GUI-spawned
                  // job can sit forever waiting on a keypress that will never come.
@@ -122,7 +125,7 @@ enum FFmpeg {
                 a += ["-profile:v", String(preset.proresProfile)]
             } else if style == .crf, preset.qualityMode == .crf {
                 a += ["-crf", String(preset.crf)]
-                let cap = preset.sizeCapKbps(forDuration: effectiveDuration(job))
+                let cap = preset.sizeCapKbps(forDuration: budget)
                 if preset.videoCodec == "libvpx-vp9" {
                     // VP9 reads -crf only when the bitrate is pinned to 0; left alone it
                     // treats the CRF as a cap and targets its own default rate instead.
@@ -134,10 +137,13 @@ enum FFmpeg {
                     a += ["-maxrate", "\(cap)k", "-bufsize", "\(cap * 2)k"]
                 }
             } else if style == .crf || style == .bitrate {
-                let kbps = preset.videoKbps(forDuration: effectiveDuration(job))
+                let kbps = preset.videoKbps(forDuration: budget)
                 a += ["-b:v", "\(kbps)k"]
-                if preset.qualityMode == .targetSize
-                    || preset.sizeCapKbps(forDuration: effectiveDuration(job)) != nil {
+                // SVT-AV1 refuses a VBV ceiling outside CRF mode ("Max Bitrate only
+                // supported with CRF mode") and writes nothing, so AV1 goes uncapped.
+                if preset.videoCodec != "libsvtav1",
+                   preset.qualityMode == .targetSize
+                    || preset.sizeCapKbps(forDuration: budget) != nil {
                     // A target is a promise about the whole file, so cap the peaks: one
                     // busy scene at 3x the average is how a 25 MB target lands at 40 MB.
                     a += ["-maxrate", "\(kbps * 3 / 2)k", "-bufsize", "\(kbps * 2)k"]
@@ -155,7 +161,9 @@ enum FFmpeg {
                 // -2 keeps the aspect ratio and rounds to an even width, which every H.26x
                 // encoder requires; min() means a 480p source is never blown up to 1080p.
                 // The comma is escaped because ffmpeg reads a bare one as a filter separator.
-                filters.append("scale=-2:min(ih\\,\(preset.maxHeight))")
+                // Rounded down to even: a 241-line source under the cap passed through
+                // odd, and x264 refuses it ("height not divisible by 2").
+                filters.append("scale=-2:trunc(min(ih\\,\(preset.maxHeight))/2)*2")
             }
             // After the scale, so the grade runs on the smaller frame; LUT before eq, so a
             // log-to-Rec.709 LUT normalises first and the sliders adjust what it produced.
@@ -347,6 +355,24 @@ enum FFmpeg {
     /// is stream layout the user did not ask for.
     static func cleanError(_ tail: String) -> String {
         let lines = tail.split(whereSeparator: \.isNewline).map(String.init)
+        // ffmpeg 7+ states the cause once, inside a "[muxer @ 0x…]" line or an encoder's
+        // own "Svt[error]:", then unwinds — "Task finished…", "Terminating thread…",
+        // "Conversion failed!". Reading from the bottom found only the unwinding, so the
+        // first tagged line that names a problem wins. Info lines ("[libx264 @ 0x…]
+        // profile High") name none.
+        let problem = #"(?i)(error|invalid|supported|unknown|no such|unable|could not|cannot|incompatible|not found|failed)"#
+        let unwinding = #"(?i)(task finished|terminating thread|conversion failed|nothing was written|error sending frames|error while opening encoder)"#
+        for line in lines {
+            var text = Substring(line)
+            while let tag = text.range(of: #"^\s*(\[[^\]]*\]|\w+\[error\]:)\s*"#, options: .regularExpression) {
+                text = text[tag.upperBound...]
+            }
+            guard text.count < line.count, !text.isEmpty,
+                  text.range(of: problem, options: .regularExpression) != nil,
+                  text.range(of: unwinding, options: .regularExpression) == nil
+            else { continue }
+            return text.trimmingCharacters(in: .whitespaces)
+        }
         let noise = #"^(\s|Input #|Output #|Stream #|\s*Metadata|\s*encoder|\s*Duration|\s*handler|frame=|\[.*@ 0x)"#
         let candidate = lines.reversed().first {
             !$0.trimmingCharacters(in: .whitespaces).isEmpty
@@ -436,10 +462,14 @@ enum FFmpeg {
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: path)
-                p.arguments = arguments(for: sample, output: output)
+                // The clip's real length, not the sample's: a size cap spread over four
+                // seconds is no cap at all, and the estimate came out too high.
+                p.arguments = arguments(for: sample, output: output, budgetDuration: total)
                 p.environment = environment
-                p.standardOutput = Pipe()
-                p.standardError = Pipe()
+                // Nothing reads these. A Pipe fills at 64 KB and an encoder that warns
+                // every frame then blocks on it forever, holding up every later measure.
+                p.standardOutput = FileHandle.nullDevice
+                p.standardError = FileHandle.nullDevice
                 guard (try? p.run()) != nil else { return cont.resume(returning: false) }
                 p.waitUntilExit()
                 cont.resume(returning: p.terminationStatus == 0)

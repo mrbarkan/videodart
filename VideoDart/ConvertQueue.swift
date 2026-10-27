@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Observation
 import UserNotifications
 
@@ -28,6 +28,22 @@ final class ConvertQueue {
         return live.reduce(0) { $0 + $1.progress } / Double(live.count)
     }
 
+    init() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.stopForQuit() } }
+    }
+
+    /// Nothing resumes a conversion after a relaunch, and an ffmpeg left running kept
+    /// writing a file nothing tracked — and never ran pass 2. Stop it, take the partial.
+    private func stopForQuit() {
+        guard let (id, process) = running else { return }
+        process.terminate()
+        process.waitUntilExit()
+        FFmpeg.removePassLogs(for: id)
+        discardOutput(of: id)
+    }
+
     // MARK: - Queue control
 
     func add(_ new: [ConvertJob]) {
@@ -55,7 +71,7 @@ final class ConvertQueue {
     }
 
     func retry(_ id: UUID) {
-        update(id) { $0.state = .queued; $0.progress = 0; $0.error = nil; $0.details = nil }
+        update(id) { $0.state = .queued; $0.progress = 0; $0.error = nil; $0.details = nil; $0.outputPath = nil }
         pump()
     }
 
@@ -94,6 +110,9 @@ final class ConvertQueue {
         guard let job = jobs.first(where: { $0.id == id }), job.state != .done,
               let path = job.outputPath else { return }
         try? FileManager.default.removeItem(atPath: path)
+        // Once deleted the name is free, and the next output for the same source takes
+        // it — removing this row later must not delete that one.
+        update(id) { $0.outputPath = nil }
     }
 
     // MARK: - Running

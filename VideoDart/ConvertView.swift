@@ -75,8 +75,9 @@ final class Staging {
     }
 
     /// Reads the first selected output and writes to every selected one, so editing a
-    /// control with six rows selected sets all six. With no output selected it edits the
-    /// preset that newly added outputs will get.
+    /// control with six rows selected sets it on all six — that one field, not the first
+    /// row's whole preset. With no output selected it edits the preset that newly added
+    /// outputs will get.
     ///
     /// "No output selected", not "nothing selected": rows in the Converting section are
     /// selectable too, and keying the write on the raw selection while the read keyed on
@@ -84,16 +85,29 @@ final class Staging {
     var editedPreset: ConvertPreset {
         get { selectedOutputs.first?.output.preset ?? workingPreset }
         set {
-            let fixed = newValue.reconciled()
-            var wrote = false
-            for f in files.indices {
-                for o in files[f].outputs.indices where selection.contains(files[f].outputs[o].id) {
-                    files[f].outputs[o].preset = fixed
-                    files[f].outputs[o].measured = nil    // it described the old settings
-                    wrote = true
-                }
+            guard let first = selectedOutputs.first?.output.preset else {
+                workingPreset = newValue.reconciled()
+                return
             }
-            if !wrote { workingPreset = fixed }
+            let changes = ConvertPreset.changedFields(from: first, to: newValue)
+            write { $0.applying(changes).reconciled() }
+        }
+    }
+
+    /// Picking a preset is how you say "these outputs, this preset": the whole of it.
+    func apply(_ preset: ConvertPreset) {
+        if selectedOutputs.isEmpty { workingPreset = preset.reconciled() } else { write { _ in preset.reconciled() } }
+    }
+
+    /// The preset the picker should show: the selected output's, while one is selected.
+    var selectedPresetID: UUID? { selectedOutputs.first?.output.preset.id }
+
+    private func write(_ change: (ConvertPreset) -> ConvertPreset) {
+        for f in files.indices {
+            for o in files[f].outputs.indices where selection.contains(files[f].outputs[o].id) {
+                files[f].outputs[o].preset = change(files[f].outputs[o].preset)
+                files[f].outputs[o].measured = nil    // it described the old settings
+            }
         }
     }
 
@@ -123,6 +137,9 @@ struct ConvertView: View {
         get { staging.workingPreset } nonmutating set { staging.workingPreset = newValue }
     }
     @State private var pickedPresetID = ConvertPreset.builtIns[0].id
+    /// Set before the app itself moves the picker, so the change isn't taken as the user
+    /// applying that preset: deleting a preset reset the selected outputs to H.264 MP4.
+    @State private var pickerMovedByApp = false
     @State private var isDropTarget = false
     @State private var showInspector = true
     @State private var savingPreset = false
@@ -141,7 +158,11 @@ struct ConvertView: View {
     }
 
     private var canConvert: Bool {
-        ffmpegInstalled && !allOutputs.isEmpty && allOutputs.allSatisfy { $0.output.trimIsValid }
+        ffmpegInstalled && !allOutputs.isEmpty && allOutputs.allSatisfy {
+            // A size target is divided by the clip's length; before the probe lands there
+            // is no length, and the job went out at a flat 8 Mbps instead.
+            $0.output.trimIsValid && ($0.file.probe != nil || !$0.output.preset.needsDuration)
+        }
     }
 
     /// Short clips are measured without being asked: the sample is four seconds whatever
@@ -222,11 +243,20 @@ struct ConvertView: View {
             Text("These settings become a preset you can pick again.")
         }
         .onChange(of: pickedPresetID) { _, id in
+            if pickerMovedByApp { pickerMovedByApp = false; return }
             guard let picked = presets.all.first(where: { $0.id == id }) else { return }
             rememberedPreset = id.uuidString
             // Picking a preset with rows selected is how you say "these files, this
             // preset" — the whole point of being able to select more than one.
-            staging.editedPreset = picked
+            staging.apply(picked)
+        }
+        // The picker names the selected output's preset, so "Update" saves into the one
+        // it shows and picking another is a real change.
+        .onChange(of: staging.selection) { _, _ in
+            guard let id = staging.selectedPresetID, id != pickedPresetID,
+                  presets.all.contains(where: { $0.id == id }) else { return }
+            pickerMovedByApp = true
+            pickedPresetID = id
         }
         .task {
             if let saved = UUID(uuidString: rememberedPreset),
@@ -240,6 +270,12 @@ struct ConvertView: View {
             // after the preset is restored, so staged rows get the one a drop would get.
             if let paths = ProcessInfo.processInfo.environment["VD_STAGE"], !paths.isEmpty {
                 _ = adopt(paths.split(separator: "\n").map { URL(fileURLWithPath: String($0)) })
+                // And VD_AUTOCONVERT presses Convert once the probes are in, which a test
+                // can't do either.
+                if ProcessInfo.processInfo.environment["VD_AUTOCONVERT"] != nil {
+                    for _ in 0..<50 where !canConvert { try? await Task.sleep(for: .milliseconds(200)) }
+                    if canConvert { convert() }
+                }
             }
             #endif
         }
@@ -278,6 +314,12 @@ struct ConvertView: View {
         ToolbarItem {
             Menu("Presets", systemImage: "slider.horizontal.3") {
                 Button("Save as Preset…") { beginSavePreset() }
+                // A Picker can't re-pick what it already shows, so edited outputs had no
+                // way back to the preset they started from.
+                if let picked = presets.all.first(where: { $0.id == pickedPresetID }),
+                   staging.editedPreset != picked.reconciled() {
+                    Button("Revert to “\(picked.name)”") { staging.apply(picked) }
+                }
                 if let current = presets.custom.first(where: { $0.id == pickedPresetID }) {
                     Button("Update “\(current.name)”") {
                         var updated = staging.editedPreset
@@ -288,6 +330,7 @@ struct ConvertView: View {
                     Divider()
                     Button("Delete “\(current.name)”", role: .destructive) {
                         presets.delete(current.id)
+                        pickerMovedByApp = true
                         pickedPresetID = ConvertPreset.builtIns[0].id
                     }
                 }
@@ -321,6 +364,8 @@ struct ConvertView: View {
                 Button("Add Files…") { chooseFiles() }
                     .adaptiveGlass(prominent: true)
             }
+            // It hugs its content otherwise, and the footer below rides up mid-window.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List(selection: $staging.selection) {
                 ForEach($staging.files) { $file in
@@ -349,10 +394,15 @@ struct ConvertView: View {
             .listStyle(.inset)
             .animation(settle, value: queue.jobs.map(\.state))
             .contextMenu(forSelectionType: UUID.self) { ids in
-                if !ids.isEmpty {
-                    Button("Remove \(ids.count) Output\(ids.count == 1 ? "" : "s")") { removeSelected(ids) }
+                // Queue rows are selectable too, and removeSelected skips them; count
+                // only what it will actually remove.
+                let outputs = outputIDs(in: ids)
+                if !outputs.isEmpty {
+                    Button("Remove \(outputs.count) Output\(outputs.count == 1 ? "" : "s")") { removeSelected(outputs) }
                 }
             }
+            // The row's remove button only shows on hover; the keyboard needs its own way.
+            .onDeleteCommand { removeSelected(outputIDs(in: selection)) }
         }
     }
 
@@ -520,6 +570,10 @@ struct ConvertView: View {
             if staged[i].outputs.isEmpty { staged.remove(at: i) }
         }
         selection.remove(outputID)
+    }
+
+    private func outputIDs(in ids: Set<UUID>) -> Set<UUID> {
+        ids.filter { id in staged.contains { $0.outputs.contains { $0.id == id } } }
     }
 
     private func removeSelected(_ ids: Set<UUID>) {
@@ -882,10 +936,19 @@ private struct PresetEditor: View {
                         Text($0 == "original" ? "Same as source" : $0.uppercased()).tag($0)
                     }
                 }
-                TextField("Extra flags", text: $staging.editedPreset.extraFlags, prompt: Text("None"))
-                    .font(.system(.body, design: .monospaced))
-                    .help("Passed to ffmpeg verbatim, e.g. -preset slow -movflags +faststart")
-                    .focused($focus, equals: .flags)
+                // Label above, field below and wrapping: side by side in the inspector the
+                // flags ran off its edge, label and all in monospace.
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Extra flags")
+                    TextField("Extra flags", text: $staging.editedPreset.extraFlags,
+                              prompt: Text("None"), axis: .vertical)
+                        .labelsHidden()
+                        .lineLimit(1...4)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.callout, design: .monospaced))
+                        .help("Passed to ffmpeg verbatim, e.g. -preset slow -movflags +faststart")
+                        .focused($focus, equals: .flags)
+                }
             } footer: {
                 if preset.isCopyOnly {
                     Text("Streams are copied, not re-encoded — fast and lossless. Trim points snap to the nearest keyframe.")
@@ -966,7 +1029,9 @@ private struct PresetEditor: View {
             case .targetSize:
                 LabeledContent("Target") {
                     HStack(spacing: 4) {
-                        TextField("Target", value: $staging.editedPreset.targetSizeMB,
+                        // Zero or negative would divide into a nonsense bitrate.
+                        TextField("Target", value: Binding(get: { preset.targetSizeMB },
+                                                           set: { preset.targetSizeMB = max(0.1, $0) }),
                                   format: .number.precision(.fractionLength(0...1)))
                             .labelsHidden()
                             .frame(width: 58)
@@ -982,7 +1047,9 @@ private struct PresetEditor: View {
             case .bitrate:
                 LabeledContent("Video") {
                     HStack(spacing: 4) {
-                        TextField("Video bitrate", value: $staging.editedPreset.videoKbps, format: .number)
+                        TextField("Video bitrate", value: Binding(get: { preset.videoKbps },
+                                                                  set: { preset.videoKbps = max(64, $0) }),
+                                  format: .number)
                             .labelsHidden()
                             .frame(width: 66)
                             .multilineTextAlignment(.trailing)
@@ -1010,6 +1077,8 @@ private struct PresetEditor: View {
                 } maximumValueLabel: {
                     Text("Smallest").font(.caption2)
                 }
+                .accessibilityLabel("Quality, CRF")    // the visible label is the row above
+                .accessibilityValue("\(preset.crf), lower is better")
                 Text("Constant quality: every file looks the same, but the size depends on the footage. Press Measure on a row for a real figure.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1028,7 +1097,7 @@ private struct PresetEditor: View {
                             .multilineTextAlignment(.trailing)
                             .monospacedDigit()
                             .focused($focus, equals: .sizeLimit)
-                        Text("MB")
+                        if preset.maxSizeMB > 0 { Text("MB") }   // not "None MB"
                     }
                 }
                 .help("Lowers the bitrate on long clips so the file stays under this size")

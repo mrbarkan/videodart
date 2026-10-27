@@ -77,7 +77,8 @@ enum Encoders {
                      containers: ["original", "mp4", "mkv", "mov", "m4a"]),
         AudioEncoder(id: "aac", label: "AAC", takesBitrate: true,
                      containers: ["m4a", "mp4", "mkv", "mov"]),
-        AudioEncoder(id: "libmp3lame", label: "MP3", takesBitrate: true, containers: ["mp3"]),
+        AudioEncoder(id: "libmp3lame", label: "MP3", takesBitrate: true,
+                     containers: ["mp3", "mp4", "mkv", "mov"]),
         AudioEncoder(id: "libopus", label: "Opus", takesBitrate: true,
                      containers: ["opus", "webm", "mkv"]),
         AudioEncoder(id: "flac", label: "FLAC (lossless)", takesBitrate: false,
@@ -192,7 +193,21 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         let budget = mb * 8000 / seconds
         // Container overhead is small but real, and overshooting a target is worse than
         // undershooting it, so hand back 3% before splitting the rest with the audio.
-        return max(64, Int(budget * 0.97) - (audioTakesBitrate ? audioKbps : 0))
+        return max(64, Int(budget * 0.97) - reservedAudioKbps)
+    }
+
+    /// What the audio takes out of a size budget. Only bitrate codecs state it; a copied
+    /// or lossless track spends what it spends, so those are reserved at their usual
+    /// worst case. Leaving them out put a 25 MB target with copied 256k audio near
+    /// 44 MB over ten minutes.
+    var reservedAudioKbps: Int {
+        guard includeAudio else { return 0 }
+        if audioTakesBitrate { return audioKbps }
+        switch audioCodec {
+        case "pcm_s16le": return 1536      // 48 kHz stereo, 16-bit
+        case "flac": return 1000           // lossless rarely beats two-thirds of PCM
+        default: return 320                // copied: the most a lossy stereo track carries
+        }
     }
 
     /// x264 refuses CRF with two passes outright ("CRF/CQP is incompatible with 2pass");
@@ -204,6 +219,11 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
     }
 
     var usesTwoPass: Bool { twoPass && supportsTwoPass }
+
+    /// Whether the bitrate depends on the clip's length: a target size, or a size limit.
+    var needsDuration: Bool {
+        !availableQualityModes.isEmpty && (qualityMode == .targetSize || maxSizeMB > 0)
+    }
 
     var hasColorAdjustment: Bool {
         brightness != 0 || contrast != 1 || saturation != 1
@@ -218,9 +238,9 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
             guard let sourceBytes, let sourceDuration, sourceDuration > 0 else { return nil }
             return Int64(Double(sourceBytes) * min(1, duration / sourceDuration))
         }
-        let audio = audioTakesBitrate ? Double(audioKbps) : 0
+        let audio = Double(reservedAudioKbps)
         if !includeVideo {
-            guard audio > 0 else { return nil }   // FLAC/WAV have no bitrate to reason from
+            guard audioTakesBitrate else { return nil }   // FLAC/WAV have no bitrate to reason from
             return Int64(audio * 1000 * duration / 8)
         }
         switch qualityMode {
@@ -294,10 +314,21 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
 
     /// Containers that make sense for the streams this preset actually writes. ffmpeg
     /// would reject H.265-in-WebM anyway; catching it in the picker is friendlier.
+    ///
+    /// Both streams have to fit. Filtering by the video codec alone offered WebM with AAC,
+    /// which ffmpeg refuses ("Only … Vorbis or Opus audio … are supported for WebM").
     var allowedContainers: [String] {
-        if includeVideo, let e = Encoders.video(videoCodec) { return e.containers }
-        if includeAudio, let e = Encoders.audio(audioCodec) { return e.containers }
-        return ["original", "mp4", "mkv", "mov"]
+        let video = includeVideo ? Encoders.video(videoCodec)?.containers : nil
+        let audio = includeAudio ? Encoders.audio(audioCodec)?.containers : nil
+        switch (video, audio) {
+        case let (v?, a?):
+            let both = v.filter(a.contains)
+            // Matroska holds anything, and every video codec here offers it.
+            return both.isEmpty ? ["mkv"] : both
+        case let (v?, nil): return v
+        case let (nil, a?): return a
+        case (nil, nil): return ["original", "mp4", "mkv", "mov"]
+        }
     }
 
     /// Snaps the container and quality mode back to something the chosen codecs can
@@ -320,6 +351,32 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         return fixed
     }
 
+    // MARK: Editing several at once
+
+    /// The fields `new` changed from `old`, by their stored keys. With several outputs
+    /// selected an edit is one field, and only that field may reach the others: copying
+    /// the whole edited preset turned a selected MP3 output into an MP4 the moment the
+    /// audio bitrate was nudged.
+    static func changedFields(from old: ConvertPreset, to new: ConvertPreset) -> [String: Any] {
+        guard let a = old.fields, let b = new.fields else { return [:] }
+        return b.filter { key, value in
+            !["id", "name", "isBuiltIn"].contains(key) && (a[key] as? NSObject) != (value as? NSObject)
+        }
+    }
+
+    func applying(_ changes: [String: Any]) -> ConvertPreset {
+        guard !changes.isEmpty, var merged = fields else { return self }
+        merged.merge(changes) { _, new in new }
+        guard let data = try? JSONSerialization.data(withJSONObject: merged),
+              let preset = try? JSONDecoder().decode(ConvertPreset.self, from: data) else { return self }
+        return preset
+    }
+
+    private var fields: [String: Any]? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
     // MARK: Codable
 
     /// Written by hand because the two bitrates changed shape in 0.4.0 — they were
@@ -337,35 +394,35 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
-        name = try c.decodeIfPresent(String.self, forKey: .name) ?? "Untitled"
-        isBuiltIn = try c.decodeIfPresent(Bool.self, forKey: .isBuiltIn) ?? false
-        includeVideo = try c.decodeIfPresent(Bool.self, forKey: .includeVideo) ?? true
-        includeAudio = try c.decodeIfPresent(Bool.self, forKey: .includeAudio) ?? true
-        videoCodec = try c.decodeIfPresent(String.self, forKey: .videoCodec) ?? "libx264"
-        proresProfile = try c.decodeIfPresent(Int.self, forKey: .proresProfile) ?? 3
-        maxHeight = try c.decodeIfPresent(Int.self, forKey: .maxHeight) ?? 0
-        fps = try c.decodeIfPresent(Double.self, forKey: .fps) ?? 0
-        crf = try c.decodeIfPresent(Int.self, forKey: .crf) ?? 20
-        targetSizeMB = try c.decodeIfPresent(Double.self, forKey: .targetSizeMB) ?? 25
-        maxSizeMB = try c.decodeIfPresent(Double.self, forKey: .maxSizeMB) ?? 0
-        twoPass = try c.decodeIfPresent(Bool.self, forKey: .twoPass) ?? false
-        brightness = try c.decodeIfPresent(Double.self, forKey: .brightness) ?? 0
-        contrast = try c.decodeIfPresent(Double.self, forKey: .contrast) ?? 1
-        saturation = try c.decodeIfPresent(Double.self, forKey: .saturation) ?? 1
-        lutPath = try c.decodeIfPresent(String.self, forKey: .lutPath) ?? ""
-        audioCodec = try c.decodeIfPresent(String.self, forKey: .audioCodec) ?? "aac"
-        container = try c.decodeIfPresent(String.self, forKey: .container) ?? "mp4"
-        extraFlags = try c.decodeIfPresent(String.self, forKey: .extraFlags) ?? ""
+        id = c.lenient(UUID.self, forKey: .id) ?? UUID()
+        name = c.lenient(String.self, forKey: .name) ?? "Untitled"
+        isBuiltIn = c.lenient(Bool.self, forKey: .isBuiltIn) ?? false
+        includeVideo = c.lenient(Bool.self, forKey: .includeVideo) ?? true
+        includeAudio = c.lenient(Bool.self, forKey: .includeAudio) ?? true
+        videoCodec = c.lenient(String.self, forKey: .videoCodec) ?? "libx264"
+        proresProfile = c.lenient(Int.self, forKey: .proresProfile) ?? 3
+        maxHeight = c.lenient(Int.self, forKey: .maxHeight) ?? 0
+        fps = c.lenient(Double.self, forKey: .fps) ?? 0
+        crf = c.lenient(Int.self, forKey: .crf) ?? 20
+        targetSizeMB = c.lenient(Double.self, forKey: .targetSizeMB) ?? 25
+        maxSizeMB = c.lenient(Double.self, forKey: .maxSizeMB) ?? 0
+        twoPass = c.lenient(Bool.self, forKey: .twoPass) ?? false
+        brightness = c.lenient(Double.self, forKey: .brightness) ?? 0
+        contrast = c.lenient(Double.self, forKey: .contrast) ?? 1
+        saturation = c.lenient(Double.self, forKey: .saturation) ?? 1
+        lutPath = c.lenient(String.self, forKey: .lutPath) ?? ""
+        audioCodec = c.lenient(String.self, forKey: .audioCodec) ?? "aac"
+        container = c.lenient(String.self, forKey: .container) ?? "mp4"
+        extraFlags = c.lenient(String.self, forKey: .extraFlags) ?? ""
 
-        videoKbps = try c.decodeIfPresent(Int.self, forKey: .videoKbps)
-            ?? Self.parseRate(try c.decodeIfPresent(String.self, forKey: .videoBitrate)) ?? 8000
-        audioKbps = try c.decodeIfPresent(Int.self, forKey: .audioKbps)
-            ?? Self.parseRate(try c.decodeIfPresent(String.self, forKey: .audioBitrate)) ?? 192
+        videoKbps = c.lenient(Int.self, forKey: .videoKbps)
+            ?? Self.parseRate(c.lenient(String.self, forKey: .videoBitrate)) ?? 8000
+        audioKbps = c.lenient(Int.self, forKey: .audioKbps)
+            ?? Self.parseRate(c.lenient(String.self, forKey: .audioBitrate)) ?? 192
 
-        // A 0.3.0 preset predates the mode entirely: infer it from the codec, which is
-        // exactly what that build did implicitly.
-        if let saved = try c.decodeIfPresent(QualityMode.self, forKey: .qualityMode) {
+        // A 0.3.0 preset predates the mode entirely, and a newer build may add one this
+        // build doesn't know: infer it from the codec, which is what 0.3.0 did implicitly.
+        if let saved = c.lenient(QualityMode.self, forKey: .qualityMode) {
             qualityMode = saved
         } else {
             qualityMode = Encoders.video(videoCodec)?.quality == .bitrate ? .bitrate : .crf
@@ -414,6 +471,14 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
     }
 }
 
+/// One wrong-typed or unknown value used to throw out the whole preset — and with it, in
+/// the store, every preset in the file. A field that can't be read falls back instead.
+extension KeyedDecodingContainer {
+    func lenient<T: Decodable>(_ type: T.Type, forKey key: Key) -> T? {
+        (try? decodeIfPresent(type, forKey: key)) ?? nil
+    }
+}
+
 // MARK: - Built-in presets
 
 extension ConvertPreset {
@@ -450,8 +515,9 @@ extension ConvertPreset {
         make("WebM VP9") {
             $0.videoCodec = "libvpx-vp9"; $0.qualityMode = .crf; $0.crf = 31
             $0.audioCodec = "libopus"; $0.audioKbps = 128
-            // VP9 reads -crf only when the bitrate is pinned to 0; otherwise it is a cap.
-            $0.container = "webm"; $0.extraFlags = "-b:v 0 -row-mt 1"
+            // No -b:v 0 here: the builder pins it in CRF mode, and as an extra flag it came
+            // last and overrode Bitrate, Target size and the size limit.
+            $0.container = "webm"; $0.extraFlags = "-row-mt 1"
         },
         make("Audio: MP3 320") {
             $0.includeVideo = false
@@ -516,9 +582,27 @@ final class PresetStore {
     static let storeURL = AppSupport.file("presets.json")
 
     init() {
-        guard let data = try? Data(contentsOf: Self.storeURL),
-              let saved = try? JSONDecoder().decode([ConvertPreset].self, from: data) else { return }
-        custom = saved
+        guard let data = try? Data(contentsOf: Self.storeURL) else { return }
+        let decoded = Self.decode(data)
+        custom = decoded.presets
+        // The next save rewrites the file from what was read, so keep the original of
+        // anything that wasn't — as DownloadQueue does with an unreadable queue.
+        if decoded.lost {
+            let kept = Self.storeURL.appendingPathExtension("unreadable")
+            try? FileManager.default.removeItem(at: kept)
+            try? FileManager.default.copyItem(at: Self.storeURL, to: kept)
+        }
+    }
+
+    /// Entry by entry: one preset this build can't read must not take the rest with it.
+    nonisolated static func decode(_ data: Data) -> (presets: [ConvertPreset], lost: Bool) {
+        struct Entry: Decodable {
+            let preset: ConvertPreset?
+            init(from decoder: Decoder) throws { preset = try? ConvertPreset(from: decoder) }
+        }
+        guard let entries = try? JSONDecoder().decode([Entry].self, from: data) else { return ([], true) }
+        let presets = entries.compactMap(\.preset)
+        return (presets, presets.count < entries.count)
     }
 
     func save(_ preset: ConvertPreset) {

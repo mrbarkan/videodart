@@ -283,7 +283,7 @@ enum SelfCheck {
         let small = FFmpeg.arguments(for: ConvertJob(source: source, preset: scaled), output: output)
         // The escaped comma matters: ffmpeg reads a bare one as a filter separator and
         // rejects the graph, so this is the difference between 720p and a failed job.
-        assert(adjacent(small, ["-vf", "scale=-2:min(ih\\,720)"]),
+        assert(adjacent(small, ["-vf", "scale=-2:trunc(min(ih\\,720)/2)*2"]),
                "got: \(small.first { $0.hasPrefix("scale") } ?? "no scale filter")")
         assert(adjacent(small, ["-r", "30"]))
 
@@ -370,6 +370,25 @@ enum SelfCheck {
         assert(FFmpeg.cleanError("/tmp/some file.mov: Invalid data found when processing input")
                == "Invalid data found when processing input", "the path is already on the row")
         assert(!FFmpeg.cleanError("").isEmpty, "a silent failure still needs a message")
+        // ffmpeg 9, verbatim and trimmed: the cause comes first, then the unwinding. Read
+        // from the bottom, both of these used to say only "Conversion failed!".
+        let svt = FFmpeg.cleanError("""
+        [libx264 @ 0x771b029180] profile High, level 1.2, 4:2:0, 8-bit
+        Svt[error]: Max Bitrate only supported with CRF mode
+        [libsvtav1 @ 0x7929025180] Error setting encoder parameters: bad parameter (0x80001005)
+        [vf#0:0 @ 0x7929030000] Task finished with error code: -22 (Invalid argument)
+        [out#0/mp4 @ 0x7a5500c780] Nothing was written into output file, because at least one of its streams received no packets.
+        Conversion failed!
+        """)
+        assert(svt == "Max Bitrate only supported with CRF mode", "got: \(svt)")
+        let webm = FFmpeg.cleanError("""
+        [libvpx-vp9 @ 0x7849049180] Neither bitrate nor constrained quality specified, using default CRF of 32
+        [webm @ 0x7848c11400] Only VP8 or VP9 or AV1 video and Vorbis or Opus audio and WebVTT subtitles are supported for WebM.
+        [out#0/webm @ 0x784904c300] Could not write header (incorrect codec parameters ?): Invalid argument
+        [vf#0:0 @ 0x7848c24000] Error sending frames to consumers: Invalid argument
+        Conversion failed!
+        """)
+        assert(webm.hasPrefix("Only VP8 or VP9 or AV1 video"), "got: \(webm)")
 
 
         // MARK: Quality modes — the size-led ones and what they emit
@@ -403,6 +422,23 @@ enum SelfCheck {
         assert(budgeted.contains("-maxrate") && budgeted.contains("-bufsize"),
                "a target is a promise about the whole file; peaks must be capped")
         assert(!budgeted.contains("-crf"))
+        var av1Sized = sized
+        av1Sized.videoCodec = "libsvtav1"
+        var av1Job = ConvertJob(source: source, preset: av1Sized)
+        av1Job.sourceDuration = 100
+        assert(!FFmpeg.arguments(for: av1Job, output: output).contains("-maxrate"),
+               "SVT-AV1 rejects -maxrate outside CRF mode and writes nothing")
+
+        // Measure encodes four seconds of a longer clip; the size cap is the clip's.
+        var cappedCRF = h264
+        cappedCRF.maxSizeMB = 100
+        var sample = ConvertJob(source: source, preset: cappedCRF)
+        sample.trimStart = "0"; sample.trimEnd = "4"
+        let sampleArgs = FFmpeg.arguments(for: sample, output: output, budgetDuration: 400)
+        let wholeArgs = FFmpeg.arguments(for: sample, output: output)
+        assert(adjacent(sampleArgs, ["-maxrate", "\(Int(100 * 8000 / 400 * 0.97) - 192)k"]),
+               "the sample must be capped for 400 s, got \(sampleArgs)")
+        assert(sampleArgs != wholeArgs, "without the clip's length the cap spreads over 4 s")
 
         // VP9 needs the bitrate pinned to zero for -crf to mean constant quality, and
         // must NOT get that pin when it is being asked for a real bitrate.
@@ -497,6 +533,48 @@ enum SelfCheck {
                "a copy of half the clip is half the bytes")
         assert(remuxOnly.estimatedBytes(duration: 120, sourceBytes: 1000, sourceDuration: 60) == 1000,
                "an untrimmed copy is the whole source, never more")
+
+        // A copied or lossless track spends what it spends; the budget has to leave room
+        // for it, or a 25 MB target with copied 256k audio lands near 44 MB.
+        var sizedCopyAudio = sized
+        sizedCopyAudio.audioCodec = Encoders.copyID
+        assert(sizedCopyAudio.videoKbps(forDuration: 100) == Int(25 * 8000 / 100 * 0.97) - 320,
+               "copied audio must be reserved, got \(sizedCopyAudio.videoKbps(forDuration: 100))")
+        var sizedWAV = sized
+        sizedWAV.audioCodec = "pcm_s16le"
+        assert(sizedWAV.videoKbps(forDuration: 100) < sized.videoKbps(forDuration: 100) - 1000,
+               "uncompressed audio takes most of a small budget")
+        var sizedSilent = sized
+        sizedSilent.includeAudio = false
+        assert(sizedSilent.videoKbps(forDuration: 100) == Int(25 * 8000 / 100 * 0.97),
+               "no audio, nothing to reserve")
+
+        // MARK: Containers must take both streams
+        var vp9AAC = h264
+        vp9AAC.videoCodec = "libvpx-vp9"
+        assert(vp9AAC.allowedContainers == ["mkv"], "WebM refuses AAC; got \(vp9AAC.allowedContainers)")
+        var h264PCM = h264
+        h264PCM.audioCodec = "pcm_s16le"
+        assert(!h264PCM.allowedContainers.contains("mp4"), "MP4 takes no PCM")
+        var av1MP3 = h264
+        av1MP3.videoCodec = "libsvtav1"; av1MP3.audioCodec = "libmp3lame"
+        assert(av1MP3.allowedContainers.contains("mp4"), "MP3 muxes into MP4")
+        for preset in ConvertPreset.builtIns {
+            assert(preset.reconciled() == preset, "built-in \(preset.name) must already be consistent")
+        }
+
+        // MARK: Editing several outputs: only the edited field travels
+        let mp3 = ConvertPreset.builtIns.first { $0.name == "Audio: MP3 320" }!
+        var nudged = h264
+        nudged.audioKbps = 256
+        let changes = ConvertPreset.changedFields(from: h264, to: nudged)
+        assert(changes.keys.sorted() == ["audioKbps"], "got \(changes.keys.sorted())")
+        let stillMP3 = mp3.applying(changes)
+        assert(stillMP3.audioKbps == 256, "the edit must land")
+        assert(!stillMP3.includeVideo && stillMP3.container == "mp3" && stillMP3.audioCodec == "libmp3lame",
+               "an MP3 output must not become the first row's MP4")
+        assert(stillMP3.id == mp3.id && stillMP3.name == mp3.name, "identity is not an edit")
+        assert(mp3.applying([:]) == mp3)
 
         // MARK: Which modes each codec can offer
         assert(h264.availableQualityModes == [.targetSize, .bitrate, .crf])
@@ -612,6 +690,24 @@ enum SelfCheck {
         roundGraded.twoPass = true; roundGraded.maxSizeMB = 20
         let gradedRound = try? JSONDecoder().decode(ConvertPreset.self, from: JSONEncoder().encode(roundGraded))
         assert(gradedRound == roundGraded, "every new field must survive a save")
+
+        // One wrong-typed value, or a mode a newer build added, must cost that field —
+        // not the preset, and through the store not every preset in the file.
+        let future = """
+        [{"name":"Future","qualityMode":"perceptual","crf":"18","videoCodec":"libx265","audioKbps":160},
+         {"name":"Fine","crf":22},
+         7]
+        """
+        let decoded = PresetStore.decode(Data(future.utf8))
+        assert(decoded.presets.count == 2, "a bad entry must not take the others; got \(decoded.presets.count)")
+        assert(decoded.lost, "the dropped entry must be reported so the file is kept")
+        assert(decoded.presets[0].name == "Future" && decoded.presets[0].audioKbps == 160,
+               "readable fields survive their unreadable neighbours")
+        assert(decoded.presets[0].crf == 20, "a wrong-typed field falls back to its default")
+        assert(decoded.presets[0].qualityMode == .crf, "an unknown mode is inferred from the codec")
+        assert(decoded.presets[1].crf == 22)
+        assert(!PresetStore.decode(Data(legacy.utf8)).lost)
+        assert(PresetStore.decode(Data("not json".utf8)).lost)
     }
 }
 #endif
