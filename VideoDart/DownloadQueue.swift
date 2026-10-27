@@ -189,7 +189,7 @@ final class DownloadQueue {
                         // fix itself, and neither will a bad cookie setting, so those go
                         // straight to the user.
                         if attempts[id, default: 0] < 1, !YTDLP.isAuthError(message),
-                           !YTDLP.isCookieSetupError(message) {
+                           !YTDLP.isCookieSetupError(message), !YTDLP.isCookiePermissionError(message) {
                             attempts[id, default: 0] += 1
                             job.state = .queued
                             job.error = nil

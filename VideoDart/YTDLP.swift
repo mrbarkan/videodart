@@ -348,15 +348,27 @@ enum YTDLP {
 
     /// yt-dlp errors arrive as one long line of message + CLI hints + wiki links.
     /// Keep the sentences a human needs; the app handles the cookie flags itself.
-    static func cleanError(_ raw: String) -> String {
+    ///
+    /// `blocked` says whether macOS keeps VideoDart out of a browser's folder; a parameter
+    /// so SelfCheck doesn't depend on how this Mac's privacy settings happen to be.
+    static func cleanError(_ raw: String, blocked: (String) -> Bool = isCookieFolderBlocked) -> String {
         var line = String(raw.split(separator: "\n").last(where: { $0.contains("ERROR") })
             ?? raw.split(separator: "\n").last ?? "Unknown error")
         line = line.replacingOccurrences(of: "ERROR: ", with: "")
         // The path yt-dlp quotes is the browser's folder plus the Profile setting, which is
         // easy to get wrong: Chrome's menu says "David", its folder says "Profile 1".
         if let r = line.range(of: #"could not find \w+ cookies database"#, options: .regularExpression) {
-            let browser = line[r].split(separator: " ")[3].capitalized
-            return "Couldn’t find \(browser)’s cookies. \(cookieSetupHint)"
+            let browser = String(line[r].split(separator: " ")[3])
+            // The same words when macOS hides the folder: yt-dlp searches it, sees
+            // nothing, and blames the profile. Only the folder's readability tells them apart.
+            if blocked(browser) {
+                return "macOS isn’t letting VideoDart read \(browser.capitalized)’s cookies. \(cookiePermissionHint)"
+            }
+            return "Couldn’t find \(browser.capitalized)’s cookies. \(cookieSetupHint)"
+        }
+        // Safari's file is read directly, so the refusal arrives as itself.
+        if line.contains("Operation not permitted"), line.localizedCaseInsensitiveContains("cookies") {
+            return "macOS isn’t letting VideoDart read the browser’s cookies. \(cookiePermissionHint)"
         }
         // Cut sentence-wise, not at the hint token: Instagram phrases it mid-sentence
         // ("…if it is not, then use --cookies…"), so cutting at the token leaves a
@@ -388,13 +400,55 @@ enum YTDLP {
         message.hasSuffix(cookieSetupHint)
     }
 
+    private static let cookiePermissionHint =
+        "Turn VideoDart on in System Settings ▸ Privacy & Security ▸ Full Disk Access, then try again."
+
+    /// macOS refused the browser's data. Privacy settings fix it; nothing in VideoDart does.
+    static func isCookiePermissionError(_ message: String) -> Bool {
+        message.hasSuffix(cookiePermissionHint)
+    }
+
+    static let fullDiskAccessSettings =
+        URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+
+    /// Where each browser keeps its profiles.
+    private static func browserFolder(_ browser: String) -> String? {
+        let support = NSHomeDirectory() + "/Library/Application Support/"
+        return switch browser {
+        case "chrome": support + "Google/Chrome"
+        case "brave": support + "BraveSoftware/Brave-Browser"
+        case "edge": support + "Microsoft Edge"
+        case "chromium": support + "Chromium"
+        case "vivaldi": support + "Vivaldi"
+        case "opera": support + "com.operasoftware.Opera"
+        case "firefox": support + "Firefox"
+        case "safari": NSHomeDirectory() + "/Library/Containers/com.apple.Safari/Data/Library/Cookies"
+        default: nil
+        }
+    }
+
+    /// macOS's privacy protection keeps an app — and yt-dlp, which runs as part of it —
+    /// out of another app's data until it has Full Disk Access. Launched from a terminal
+    /// it inherits the terminal's access, which is why this never showed in testing.
+    static func isCookieFolderBlocked(_ browser: String) -> Bool {
+        guard let folder = browserFolder(browser.lowercased()),
+              FileManager.default.fileExists(atPath: folder) else { return false }
+        do {
+            _ = try FileManager.default.contentsOfDirectory(atPath: folder)
+            return false
+        } catch let error as NSError {
+            let posix = (error.userInfo[NSUnderlyingErrorKey] as? NSError)?.code
+            return error.code == NSFileReadNoPermissionError || posix == Int(EPERM) || posix == Int(EACCES)
+        }
+    }
+
     /// Errors a browser sign-in would fix. A regex rather than a list of literals because
     /// every site spells it differently — YouTube says "Sign in", Instagram says both
     /// "log in" and "logged-in", and a missed spelling means the sheet offers the user
     /// no way out of a wall they could clear by picking a browser. "registered users" is
     /// the default wording of yt-dlp's raise_login_required, so it covers many extractors.
     static func isAuthError(_ message: String) -> Bool {
-        !isCookieSetupError(message) && message.range(
+        !isCookieSetupError(message) && !isCookiePermissionError(message) && message.range(
             of: #"(?i)(sign ?in|log ?in|logged.?in|registered users|confirm your age|cookies|private video|members.only|not a bot)"#,
             options: .regularExpression) != nil
     }

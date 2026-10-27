@@ -21,6 +21,7 @@ struct SettingsView: View {
     // keystroke replaced the template.
     @FocusState private var focused: Bool
     @State private var archiveCount = 0
+    @State private var cookiesBlocked = false
 
     var body: some View {
         TabView {
@@ -124,13 +125,27 @@ struct SettingsView: View {
                         .help("Browser profile name or path, e.g. \"Profile 1\"")
                 }
             } footer: {
-                Text(accountHelp)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 6) {
+                    // Said here, before a download fails with the browser's cookies "missing".
+                    if cookiesBlocked {
+                        Text("macOS isn’t letting VideoDart read \(cookieSource.capitalized)’s cookies. Turn VideoDart on under Full Disk Access.")
+                            .foregroundStyle(.orange)
+                        Button("Open Privacy Settings…") { NSWorkspace.shared.open(YTDLP.fullDiskAccessSettings) }
+                            .controlSize(.small)
+                    }
+                    Text(accountHelp)
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)
+        // Re-read on every visit too: the grant happens in System Settings, meanwhile.
+        .task(id: cookieSource) { cookiesBlocked = YTDLP.isCookieFolderBlocked(cookieSource) }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            cookiesBlocked = YTDLP.isCookieFolderBlocked(cookieSource)
+        }
     }
 
     private var accountHelp: String {
@@ -138,7 +153,7 @@ struct SettingsView: View {
         case "none":
             "Age-restricted and members-only videos need a signed-in session. Pick the browser you are already logged into YouTube with."
         case "safari":
-            "Safari cookies are readable only if this app has Full Disk Access (System Settings ▸ Privacy & Security ▸ Full Disk Access). Quit the browser first."
+            "Safari cookies are readable only if this app has Full Disk Access (System Settings ▸ Privacy & Security ▸ Full Disk Access)."
         case "file":
             "Export cookies.txt from a browser extension while signed in to YouTube."
         default:

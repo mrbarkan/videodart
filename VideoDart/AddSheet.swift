@@ -216,6 +216,9 @@ struct AddSheet: View {
             HStack {
                 if needsSignIn { SettingsLink { Text("More Options…") } }
                 if YTDLP.isCookieSetupError(message) { SettingsLink { Text("Open Settings…") } }
+                if YTDLP.isCookiePermissionError(message) {
+                    Button("Open Privacy Settings…") { NSWorkspace.shared.open(YTDLP.fullDiskAccessSettings) }
+                }
                 Button("Try Again") { Task { await probe() } }
                     .adaptiveGlass(prominent: true)
                     .disabled(needsSignIn && cookieSource == "none")

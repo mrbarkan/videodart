@@ -134,13 +134,24 @@ enum SelfCheck {
         // A profile that names no folder. "cookies" made this read as a sign-in wall, and
         // picking the same browser again in that sheet just repeated it — the fix is the
         // Profile field, which only Settings has.
-        let profile = YTDLP.cleanError("""
+        let missing = """
         ERROR: could not find chrome cookies database in "/Users/u/Library/Application Support/Google/Chrome/u"
-        """)
+        """
+        let profile = YTDLP.cleanError(missing, blocked: { _ in false })
         assert(profile.hasPrefix("Couldn’t find Chrome’s cookies."), "got: \(profile)")
         assert(YTDLP.isCookieSetupError(profile), "a missing cookie database must point at Settings")
         assert(!YTDLP.isAuthError(profile), "a missing cookie database is not a sign-in wall")
         assert(!YTDLP.isCookieSetupError(story), "a real sign-in wall is not a settings problem")
+
+        // The same yt-dlp words when macOS keeps VideoDart out of the browser's folder —
+        // which only shows when launched from Finder, never from a terminal.
+        let blocked = YTDLP.cleanError(missing, blocked: { $0 == "chrome" })
+        assert(blocked.hasPrefix("macOS isn’t letting VideoDart read Chrome’s cookies."), "got: \(blocked)")
+        assert(YTDLP.isCookiePermissionError(blocked) && !YTDLP.isCookieSetupError(blocked))
+        assert(!YTDLP.isAuthError(blocked), "a privacy refusal is not a sign-in wall")
+        let safari = YTDLP.cleanError("ERROR: [Errno 1] Operation not permitted: '/Users/u/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies'")
+        assert(YTDLP.isCookiePermissionError(safari), "got: \(safari)")
+        assert(!YTDLP.isCookieFolderBlocked("none") && !YTDLP.isCookieFolderBlocked("file"))
 
         assert(YTDLP.displayTitle("DHC August Video_02.mp4") == "DHC August Video_02")
         assert(YTDLP.displayTitle("Talk: v1.0 of the thing") == "Talk: v1.0 of the thing",
