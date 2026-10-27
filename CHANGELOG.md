@@ -3,6 +3,17 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.6.3 (Beta), 2026-10-27
+
+### Fixed
+
+- **Presets you saved from the old WebM VP9 preset** now honour Target size, Bitrate and
+  Size limit again. They carried a hidden flag that overrode all three.
+- **Settings no longer opens with the Filename template selected,** where one stray key
+  replaced it.
+- **VoiceOver can remove an output** from the Convert list; the remove button only
+  appears on hover.
+
 ## 0.6.2 (Beta), 2026-10-27
 
 A full pass over both halves of the app.
