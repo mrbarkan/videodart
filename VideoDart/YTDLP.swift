@@ -286,6 +286,12 @@ enum YTDLP {
         var line = String(raw.split(separator: "\n").last(where: { $0.contains("ERROR") })
             ?? raw.split(separator: "\n").last ?? "Unknown error")
         line = line.replacingOccurrences(of: "ERROR: ", with: "")
+        // The path yt-dlp quotes is the browser's folder plus the Profile setting, which is
+        // easy to get wrong: Chrome's menu says "David", its folder says "Profile 1".
+        if let r = line.range(of: #"could not find \w+ cookies database"#, options: .regularExpression) {
+            let browser = line[r].split(separator: " ")[3].capitalized
+            return "Couldn’t find \(browser)’s cookies. \(cookieSetupHint)"
+        }
         // Cut sentence-wise, not at the hint token: Instagram phrases it mid-sentence
         // ("…if it is not, then use --cookies…"), so cutting at the token leaves a
         // dangling clause. Matching literals also missed yt-dlp's lowercase "use --"
@@ -308,13 +314,21 @@ enum YTDLP {
         return line.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static let cookieSetupHint =
+        "Check Profile in Settings ▸ Account — leave it blank for the browser’s default profile."
+
+    /// The cookie source points nowhere. Settings fixes it; signing in again does not.
+    static func isCookieSetupError(_ message: String) -> Bool {
+        message.hasSuffix(cookieSetupHint)
+    }
+
     /// Errors a browser sign-in would fix. A regex rather than a list of literals because
     /// every site spells it differently — YouTube says "Sign in", Instagram says both
     /// "log in" and "logged-in", and a missed spelling means the sheet offers the user
     /// no way out of a wall they could clear by picking a browser. "registered users" is
     /// the default wording of yt-dlp's raise_login_required, so it covers many extractors.
     static func isAuthError(_ message: String) -> Bool {
-        message.range(
+        !isCookieSetupError(message) && message.range(
             of: #"(?i)(sign ?in|log ?in|logged.?in|registered users|confirm your age|cookies|private video|members.only|not a bot)"#,
             options: .regularExpression) != nil
     }

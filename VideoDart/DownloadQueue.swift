@@ -161,8 +161,10 @@ final class DownloadQueue {
                         job.details = tail
                         // YouTube intermittently degrades to a player client that refuses the
                         // video; a second attempt usually succeeds. A sign-in failure will not
-                        // fix itself, so that one goes straight to the user.
-                        if attempts[id, default: 0] < 1, !YTDLP.isAuthError(message) {
+                        // fix itself, and neither will a bad cookie setting, so those go
+                        // straight to the user.
+                        if attempts[id, default: 0] < 1, !YTDLP.isAuthError(message),
+                           !YTDLP.isCookieSetupError(message) {
                             attempts[id, default: 0] += 1
                             job.state = .queued
                             job.error = nil

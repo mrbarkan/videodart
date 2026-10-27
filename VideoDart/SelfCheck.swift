@@ -110,6 +110,17 @@ enum SelfCheck {
                "got: \(followers)")
         assert(YTDLP.isAuthError(followers), "\"registered users\" must offer the sign-in fix")
 
+        // A profile that names no folder. "cookies" made this read as a sign-in wall, and
+        // picking the same browser again in that sheet just repeated it — the fix is the
+        // Profile field, which only Settings has.
+        let profile = YTDLP.cleanError("""
+        ERROR: could not find chrome cookies database in "/Users/u/Library/Application Support/Google/Chrome/u"
+        """)
+        assert(profile.hasPrefix("Couldn’t find Chrome’s cookies."), "got: \(profile)")
+        assert(YTDLP.isCookieSetupError(profile), "a missing cookie database must point at Settings")
+        assert(!YTDLP.isAuthError(profile), "a missing cookie database is not a sign-in wall")
+        assert(!YTDLP.isCookieSetupError(story), "a real sign-in wall is not a settings problem")
+
         assert(YTDLP.displayTitle("DHC August Video_02.mp4") == "DHC August Video_02")
         assert(YTDLP.displayTitle("Talk: v1.0 of the thing") == "Talk: v1.0 of the thing",
                "a dot that is not a media extension must survive")

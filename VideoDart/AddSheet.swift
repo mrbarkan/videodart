@@ -215,6 +215,7 @@ struct AddSheet: View {
 
             HStack {
                 if needsSignIn { SettingsLink { Text("More Options…") } }
+                if YTDLP.isCookieSetupError(message) { SettingsLink { Text("Open Settings…") } }
                 Button("Try Again") { Task { await probe() } }
                     .adaptiveGlass(prominent: true)
                     .disabled(needsSignIn && cookieSource == "none")
