@@ -171,6 +171,9 @@ struct DownloadPane: View {
                 .animation(settle, value: queue.jobs.map(\.state))
             }
         }
+        // The empty states hug their content, and the insets below attach to whatever
+        // they wrap — so without this the banner and status bar float mid-window.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .toolbar { toolbar }
         .safeAreaInset(edge: .top, spacing: 0) { banners }
         .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }
