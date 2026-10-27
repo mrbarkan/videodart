@@ -745,6 +745,8 @@ private struct OutputRow: View {
         .padding(.vertical, 3)
         .contentShape(.rect)
         .onHover { hovering = $0 }
+        // The remove button only exists on hover, so VoiceOver never found it.
+        .accessibilityAction(named: "Remove Output", onRemove)
     }
 }
 

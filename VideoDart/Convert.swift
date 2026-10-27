@@ -414,6 +414,14 @@ struct ConvertPreset: Identifiable, Codable, Hashable {
         audioCodec = c.lenient(String.self, forKey: .audioCodec) ?? "aac"
         container = c.lenient(String.self, forKey: .container) ?? "mp4"
         extraFlags = c.lenient(String.self, forKey: .extraFlags) ?? ""
+        // The VP9 built-in shipped -b:v 0 in its extra flags until 0.6.2, and presets saved
+        // from it still carry it. Coming last, it overrode Bitrate, Target size and the
+        // size limit; the builder pins it itself in CRF mode now.
+        if videoCodec == "libvpx-vp9" {
+            extraFlags = extraFlags
+                .replacingOccurrences(of: #"(^|\s)-b:v\s+0(?=\s|$)"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+        }
 
         videoKbps = c.lenient(Int.self, forKey: .videoKbps)
             ?? Self.parseRate(c.lenient(String.self, forKey: .videoBitrate)) ?? 8000

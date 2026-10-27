@@ -576,6 +576,33 @@ enum SelfCheck {
         assert(stillMP3.id == mp3.id && stillMP3.name == mp3.name, "identity is not an edit")
         assert(mp3.applying([:]) == mp3)
 
+        // And through Staging, the object the inspector edits: an MP4 and an MP3 output
+        // selected together, one bitrate nudged.
+        MainActor.assumeIsolated {
+            let staging = Staging()
+            let mp4Out = StagedOutput(preset: h264), mp3Out = StagedOutput(preset: mp3)
+            staging.files = [StagedFile(url: source, outputs: [mp4Out, mp3Out])]
+            staging.selection = [mp4Out.id, mp3Out.id]
+            var edit = staging.editedPreset
+            edit.audioKbps = 256
+            staging.editedPreset = edit
+            let after = staging.files[0].outputs.map(\.preset)
+            assert(after.allSatisfy { $0.audioKbps == 256 }, "the edit must reach every selected output")
+            assert(after[1].container == "mp3" && !after[1].includeVideo, "the MP3 output must stay MP3")
+            assert(after[0].container == "mp4" && after[0].includeVideo)
+            // Picking a preset is the whole preset, on all of them.
+            staging.apply(mp3)
+            assert(staging.files[0].outputs.allSatisfy { $0.preset == mp3.reconciled() })
+            assert(staging.selectedPresetID == mp3.id)
+            // With nothing selected, edits go to the preset new files get, not to rows.
+            staging.selection = []
+            var working = staging.editedPreset
+            working.crf = 30
+            staging.editedPreset = working
+            assert(staging.workingPreset.crf == 30)
+            assert(staging.files[0].outputs.allSatisfy { $0.preset == mp3.reconciled() })
+        }
+
         // MARK: Which modes each codec can offer
         assert(h264.availableQualityModes == [.targetSize, .bitrate, .crf])
         assert(hardware.availableQualityModes == [.targetSize, .bitrate],
@@ -707,6 +734,15 @@ enum SelfCheck {
         assert(decoded.presets[0].qualityMode == .crf, "an unknown mode is inferred from the codec")
         assert(decoded.presets[1].crf == 22)
         assert(!PresetStore.decode(Data(legacy.utf8)).lost)
+
+        // A preset saved from the old VP9 built-in loses the -b:v 0 that overrode its
+        // size controls; anything else in its flags, and other codecs' flags, stay.
+        let oldVP9 = PresetStore.decode(Data("""
+        [{"name":"Mine","videoCodec":"libvpx-vp9","extraFlags":"-b:v 0 -row-mt 1"},
+         {"name":"Raw","videoCodec":"libx264","extraFlags":"-b:v 0"}]
+        """.utf8)).presets
+        assert(oldVP9[0].extraFlags == "-row-mt 1", "got \(oldVP9[0].extraFlags)")
+        assert(oldVP9[1].extraFlags == "-b:v 0", "only the VP9 legacy flag is removed")
         assert(PresetStore.decode(Data("not json".utf8)).lost)
     }
 }
