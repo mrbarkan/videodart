@@ -274,7 +274,13 @@ struct AddSheet: View {
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.directoryURL = URL(fileURLWithPath: destination)
-        if panel.runModal() == .OK, let picked = panel.url { destination = picked.path }
+        if panel.runModal() == .OK, let picked = panel.url {
+            destination = picked.path
+            // Remembered: the next sheet opened on the old folder, so every download
+            // to the same place meant choosing it again. Settings and the status bar
+            // follow the same preference.
+            UserDefaults.standard.set(picked.path, forKey: Prefs.Key.downloadDir)
+        }
     }
 
     private func addToQueue() {
