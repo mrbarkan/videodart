@@ -3,6 +3,18 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.7.1, 2026-10-27
+
+### Fixed
+
+- **Pick your browser profile by name.** Settings ▸ Account now lists the browser's
+  profiles with their names and emails. Left blank, VideoDart used whichever profile
+  changed last — not necessarily the one signed in — so login-only posts could fail with
+  "Instagram sent an empty media response" while public ones still worked. When a site
+  still asks for a sign-in, the error now names the profile that was used.
+- **The download folder you choose is remembered.** Picking a folder in the Add sheet
+  makes it the default for the next download, in Settings and the status bar too.
+
 ## 0.7.0, 2026-10-27
 
 The first stable release. Everything from the 0.6 betas, plus:
