@@ -3,6 +3,24 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.6.0 (Beta), 2026-10-27
+
+### Changed
+
+- **The yt-dlp banner appears only when a newer release exists.** It used to warn once
+  the installed copy was two weeks old, even when that copy was already the newest. It
+  now checks yt-dlp's latest release, at most once a day.
+- **Update yt-dlp from the banner.** The app's own copy updates in place with one click;
+  a Homebrew or other install gets the command that actually updates it. A failed update
+  leaves the working copy in place.
+
+### Fixed
+
+- **A wrong browser profile no longer dead-ends in "Sign-In Required".** With a Profile
+  name that the browser doesn't have, downloads failed with a sign-in prompt that could
+  not fix it. The error now says the browser's cookies weren't found and opens Settings,
+  where the Profile field is.
+
 ## 0.5.1 (Beta), 2026-09-25
 
 ### Fixed
