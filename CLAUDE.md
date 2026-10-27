@@ -19,10 +19,12 @@ and a converter with saveable presets.
 Build:
 ```sh
 xcodebuild -project VideoDart.xcodeproj -scheme VideoDart \
-  -configuration Debug -destination 'platform=macOS,arch=arm64' build
+  -configuration Debug -destination 'platform=macOS,arch=arm64' -derivedDataPath build build
 ```
 
-Run it (self-checks trap on launch if anything regressed — see below):
+Run it (self-checks trap on launch if anything regressed — see below). Without
+`-derivedDataPath build` the build lands in `~/Library/Developer/Xcode/DerivedData` and
+this path runs a stale binary — `make-release.sh` also wipes `./build`:
 ```sh
 ./build/Build/Products/Debug/VideoDart.app/Contents/MacOS/VideoDart
 ```
