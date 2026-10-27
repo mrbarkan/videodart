@@ -3,6 +3,48 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.6.2 (Beta), 2026-10-27
+
+A full pass over both halves of the app.
+
+### Changed
+
+- **MP4 downloads play in QuickTime.** At each resolution H.264 video and AAC audio are
+  now preferred; before, an "MP4" could hold AV1 or VP9 with Opus audio.
+- **A link copied from inside a playlist or Mix opens as that one video,** as downloads
+  already treated it. Plain playlist links are still playlists.
+- **Pause All is now ⇧⌘P.** ⌘. is Cancel on the Mac, and pressing it to close the Add
+  sheet paused every download. **⌘1 and ⌘2** now switch between Download and Convert.
+
+### Fixed
+
+- **Conversion errors say what went wrong** — "Max Bitrate only supported with CRF mode",
+  not just "Conversion failed!".
+- **AV1 with Target size or a Size limit always failed.** It now converts.
+- **The WebM VP9 preset ignored Target size, Bitrate and Size limit.**
+- **Target size went well over** when the audio was copied, FLAC or WAV.
+- **The Container menu no longer offers combinations ffmpeg refuses,** like WebM with AAC.
+- **Sources with an odd height** failed when scaled to a resolution above their own.
+- **Removing a cancelled conversion could delete a different finished file.**
+- **Quitting stops running work cleanly.** Downloads resume where they were; ffmpeg no
+  longer keeps running, and its half-written file is removed.
+- **Pausing then quickly resuming a download** could start it twice.
+- **"Both, split" with "Skip videos already downloaded"** could finish the audio with no
+  file.
+- **Saved presets are safer.** One unreadable entry no longer loses the whole file.
+  Editing several outputs at once changes only the setting you touched; deleting a preset
+  no longer resets the selected outputs; and **Revert to** in the Presets menu undoes
+  your edits to an output.
+- **Settings:** clearing Filename no longer breaks downloads; a speed limit that isn't
+  understood is flagged instead of failing every job; raising Simultaneous downloads
+  starts the next one at once; the status bar follows a new Save to folder.
+- **The Install buttons show progress and errors,** and can't start two installs at once.
+- **Measure** respects the Size limit and can no longer hang.
+- **Layout:** the empty Convert pane keeps its bar at the bottom; Size limit no longer
+  reads "None MB"; Extra flags has room to show in full. Delete removes selected outputs.
+- **The cookie advice no longer says to quit Chrome** — reading its cookies works while
+  it's open.
+
 ## 0.6.1 (Beta), 2026-10-27
 
 ### Fixed
