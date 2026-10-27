@@ -3,15 +3,15 @@
   <channel>
     <title>VideoDart</title>
     <item>
-      <title>0.6.3 Beta</title>
-      <pubDate>Tue, 27 Oct 2026 19:44:33 -0300</pubDate>
-      <sparkle:version>202610272243</sparkle:version>
-      <sparkle:shortVersionString>0.6.3</sparkle:shortVersionString>
+      <title>0.7.0</title>
+      <pubDate>Tue, 27 Oct 2026 20:14:06 -0300</pubDate>
+      <sparkle:version>202610272312</sparkle:version>
+      <sparkle:shortVersionString>0.7.0</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <enclosure
-        url="https://github.com/mrbarkan/videodart/releases/download/v0.6.3-beta.1/VideoDart.dmg"
+        url="https://github.com/mrbarkan/videodart/releases/download/v0.7.0/VideoDart.dmg"
         type="application/octet-stream"
-        sparkle:edSignature="7G9T6Hmm5M4/x6sJ3SES7SivjXPnWLbhlaaQtPz88EMJ00sacEelwUYA28TQZ6RAG4TH5eAfTIKN1lVT3SEVDg==" length="3286966" />
+        sparkle:edSignature="MvHxfeLriMtY5DB4q1FtxyyWKKMyF+HeLSIHdpBRKzjXaHw1r7nEpqbQ0bO08kVHEkF1GhT2kuN193aZP+YGAg==" length="3313053" />
     </item>
   </channel>
 </rss>
