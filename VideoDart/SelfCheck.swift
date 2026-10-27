@@ -153,6 +153,24 @@ enum SelfCheck {
         assert(YTDLP.isCookiePermissionError(safari), "got: \(safari)")
         assert(!YTDLP.isCookieFolderBlocked("none") && !YTDLP.isCookieFolderBlocked("file"))
 
+        // Chrome's "Local State", trimmed: profiles come back in the browser's own order,
+        // named as it names them, with the folder yt-dlp needs.
+        let localState = #"""
+        {"profile":{"last_used":"Default","profiles_order":["Default","Profile 7","Profile 2"],
+         "info_cache":{"Profile 7":{"name":"Work","user_name":"w@example.com"},
+                       "Default":{"name":"David","user_name":"d@example.com"},
+                       "Profile 2":{"name":"","user_name":""}}}}
+        """#
+        let listed = YTDLP.profiles(fromLocalState: Data(localState.utf8))
+        assert(listed.map(\.folder) == ["Default", "Profile 7", "Profile 2"], "got \(listed.map(\.folder))")
+        assert(listed[0].label == "David — d@example.com")
+        assert(listed[2].label == "Profile 2", "a nameless profile falls back to its folder")
+        assert(YTDLP.profiles(fromLocalState: Data("{}".utf8)).isEmpty)
+        // A sign-in wall despite cookies names what was sent, so a wrong profile shows.
+        assert(YTDLP.profileHint(source: "chrome", profile: "")?.contains("whichever Chrome profile changed last") == true)
+        assert(YTDLP.profileHint(source: "none", profile: "") == nil)
+        assert(YTDLP.profileHint(source: "file", profile: "") == nil)
+
         assert(YTDLP.displayTitle("DHC August Video_02.mp4") == "DHC August Video_02")
         assert(YTDLP.displayTitle("Talk: v1.0 of the thing") == "Talk: v1.0 of the thing",
                "a dot that is not a media extension must survive")

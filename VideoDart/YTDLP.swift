@@ -393,7 +393,7 @@ enum YTDLP {
     }
 
     private static let cookieSetupHint =
-        "Check Profile in Settings ▸ Account — leave it blank for the browser’s default profile."
+        "Check Profile in Settings ▸ Account and pick one from the list."
 
     /// The cookie source points nowhere. Settings fixes it; signing in again does not.
     static func isCookieSetupError(_ message: String) -> Bool {
@@ -410,6 +410,46 @@ enum YTDLP {
 
     static let fullDiskAccessSettings =
         URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+
+    /// One profile of a Chromium-family browser: the folder yt-dlp takes after the colon,
+    /// and how the browser itself names it.
+    struct BrowserProfile: Hashable {
+        var folder: String
+        var label: String
+    }
+
+    /// Chrome, Brave, Edge and the rest list their profiles in "Local State". Without a
+    /// profile, yt-dlp takes whichever profile's cookie file changed last — so a blank
+    /// field silently swapped a signed-in profile for a work one that wasn't.
+    static func profiles(for browser: String) -> [BrowserProfile] {
+        guard browser != "safari", browser != "firefox", let folder = browserFolder(browser.lowercased()),
+              let data = FileManager.default.contents(atPath: folder + "/Local State") else { return [] }
+        return profiles(fromLocalState: data)
+    }
+
+    static func profiles(fromLocalState data: Data) -> [BrowserProfile] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profile = json["profile"] as? [String: Any],
+              let cache = profile["info_cache"] as? [String: Any] else { return [] }
+        let order = profile["profiles_order"] as? [String] ?? []
+        return cache.compactMap { folder, value -> BrowserProfile? in
+            guard let info = value as? [String: Any] else { return nil }
+            let name = (info["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? folder
+            let email = (info["user_name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            return BrowserProfile(folder: folder, label: email.map { "\(name) — \($0)" } ?? name)
+        }
+        .sorted { (order.firstIndex(of: $0.folder) ?? .max, $0.folder) < (order.firstIndex(of: $1.folder) ?? .max, $1.folder) }
+    }
+
+    /// Appended when a site wants a sign-in although cookies were sent: the likely cause
+    /// is a profile that isn't the signed-in one, and nothing else would say which it was.
+    static func profileHint(source: String, profile: String) -> String? {
+        guard source != "none", source != "file", !source.isEmpty else { return nil }
+        let which = profile.isEmpty
+            ? "whichever \(source.capitalized) profile changed last"
+            : "the \(source.capitalized) profile “\(profiles(for: source).first { $0.folder == profile }?.label ?? profile)”"
+        return "VideoDart sent cookies from \(which) — pick the one signed in to this site under Settings ▸ Account."
+    }
 
     /// Where each browser keeps its profiles.
     private static func browserFolder(_ browser: String) -> String? {

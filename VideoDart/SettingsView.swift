@@ -23,6 +23,7 @@ struct SettingsView: View {
     @FocusState private var focused: Bool
     @State private var archiveCount = 0
     @State private var cookiesBlocked = false
+    @State private var browserProfiles: [YTDLP.BrowserProfile] = []
 
     var body: some View {
         TabView {
@@ -122,8 +123,22 @@ struct SettingsView: View {
                         }
                     }
                 } else if cookieSource != "none" {
-                    TextField("Profile", text: $cookieProfile, prompt: Text("Default"))
-                        .help("Browser profile name or path, e.g. \"Profile 1\"")
+                    if browserProfiles.isEmpty {
+                        // Firefox, Safari, or a browser whose list can't be read: by hand.
+                        TextField("Profile", text: $cookieProfile, prompt: Text("Whichever changed last"))
+                            .help("Browser profile folder or path, e.g. \"Profile 1\"")
+                    } else {
+                        // Names and emails, not "Profile 7": the folder name is what
+                        // yt-dlp wants and the one thing nobody knows.
+                        Picker("Profile", selection: $cookieProfile) {
+                            Text("Whichever changed last").tag("")
+                            Divider()
+                            ForEach(browserProfiles, id: \.folder) { Text($0.label).tag($0.folder) }
+                            if !cookieProfile.isEmpty, !browserProfiles.contains(where: { $0.folder == cookieProfile }) {
+                                Text(cookieProfile).tag(cookieProfile)
+                            }
+                        }
+                    }
                 }
             } footer: {
                 VStack(alignment: .leading, spacing: 6) {
@@ -143,10 +158,15 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         // Re-read on every visit too: the grant happens in System Settings, meanwhile.
-        .task(id: cookieSource) { cookiesBlocked = YTDLP.isCookieFolderBlocked(cookieSource) }
+        .task(id: cookieSource) { readBrowser() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            cookiesBlocked = YTDLP.isCookieFolderBlocked(cookieSource)
+            readBrowser()
         }
+    }
+
+    private func readBrowser() {
+        cookiesBlocked = YTDLP.isCookieFolderBlocked(cookieSource)
+        browserProfiles = cookiesBlocked ? [] : YTDLP.profiles(for: cookieSource)
     }
 
     private var accountHelp: String {
@@ -158,7 +178,7 @@ struct SettingsView: View {
         case "file":
             "Export cookies.txt from a browser extension while signed in to YouTube."
         default:
-            "Use the \(cookieSource.capitalized) profile you're signed in with. macOS may ask for Keychain access the first time."
+            "Pick the \(cookieSource.capitalized) profile you're signed in with — left on “Whichever changed last”, a profile that isn't signed in can be used. macOS may ask for Keychain access the first time."
         }
     }
 

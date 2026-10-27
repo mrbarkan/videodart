@@ -206,7 +206,8 @@ struct AddSheet: View {
 
                 Text(cookieSource == "none"
                      ? "Pick the browser you are signed into that site with."
-                     : "Sign in to that site in \(cookieSource.capitalized), then try again.")
+                     : YTDLP.profileHint(source: cookieSource, profile: Prefs.string(Prefs.Key.cookieProfile))
+                        ?? "Sign in to that site in \(cookieSource.capitalized), then try again.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)

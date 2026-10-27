@@ -196,6 +196,11 @@ final class DownloadQueue {
                         } else {
                             job.state = .failed
                             job.error = message
+                            if YTDLP.isAuthError(message), let hint = YTDLP.profileHint(
+                                source: Prefs.string(Prefs.Key.cookieSource),
+                                profile: Prefs.string(Prefs.Key.cookieProfile)) {
+                                job.error = message + " " + hint
+                            }
                         }
                     }
                 }
