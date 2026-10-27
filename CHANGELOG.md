@@ -3,6 +3,23 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.7.0, 2026-10-27
+
+The first stable release. Everything from the 0.6 betas, plus:
+
+### Added
+
+- **Get beta versions,** in Settings ▸ Advanced. Off by default: VideoDart now updates to
+  stable releases only, unless you turn it on.
+
+### Fixed
+
+- **Sign-in cookies blocked by macOS.** When macOS keeps VideoDart out of your browser's
+  data, downloads that need cookies said the browser profile was wrong. They now say what
+  is actually happening and open the setting that fixes it: turn VideoDart on in System
+  Settings ▸ Privacy & Security ▸ Full Disk Access. Settings ▸ Account warns about it
+  too.
+
 ## 0.6.3 (Beta), 2026-10-27
 
 ### Fixed
