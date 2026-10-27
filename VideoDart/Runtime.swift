@@ -38,6 +38,10 @@ final class ToolInstaller {
 
     var phase: Phase = .idle
 
+    /// One run at a time: a second click used to start a parallel install whose
+    /// remove-then-move collided with the first, failing a file that had installed fine.
+    var isBusy: Bool { if case .working = phase { true } else { false } }
+
     nonisolated static let binDirectory: URL = {
         let dir = AppSupport.directory.appendingPathComponent("bin", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -66,6 +70,7 @@ final class ToolInstaller {
     #endif
 
     func install() async {
+        guard !isBusy else { return }
         do {
             if !FileManager.default.isExecutableFile(atPath: Self.managedYTDLP) {
                 try await fetch(Self.ytdlpSource, to: Self.managedYTDLP,
@@ -91,6 +96,7 @@ final class ToolInstaller {
     /// it is not the part that rots. `fetch` swaps the file only once the download has
     /// landed, so a failed update leaves the working copy in place.
     func updateYTDLP() async {
+        guard !isBusy else { return }
         do {
             try await fetch(Self.ytdlpSource, to: Self.managedYTDLP,
                             label: "Updating yt-dlp", gzipped: false)

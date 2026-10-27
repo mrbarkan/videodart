@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Observation
 import UserNotifications
 
@@ -32,6 +32,27 @@ final class DownloadQueue {
             jobs[i].speed = ""
             jobs[i].eta = ""
         }
+        // Nothing stopped yt-dlp at quit, and progress is only saved on a state change,
+        // so a relaunch read "Paused at 0%" while an orphan kept writing the .part file.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.suspendForQuit() } }
+        // Raising Simultaneous downloads in Settings should start the next job now, not
+        // at the next state change. pump() is a no-op when nothing is waiting.
+        NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.pump() } }
+    }
+
+    /// SIGINT, as Pause sends: yt-dlp keeps its .part file and --continue resumes it.
+    private func suspendForQuit() {
+        for i in jobs.indices where jobs[i].state.isActive {
+            processes[jobs[i].id]?.interrupt()
+            jobs[i].state = .paused
+            jobs[i].speed = ""
+            jobs[i].eta = ""
+        }
+        save()
     }
 
     // MARK: - Queue control
@@ -110,6 +131,10 @@ final class DownloadQueue {
             Task { [weak self] in
                 for await event in events {
                     guard let self else { return }
+                    // Resume starts a new process before a paused one has finished
+                    // exiting; the old one's events, its exit above all, must not land
+                    // on the new run — that dropped it, untracked, and retried a third.
+                    guard self.processes[id] === process else { continue }
                     self.handle(event, for: id)
                 }
             }

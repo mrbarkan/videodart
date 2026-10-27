@@ -126,6 +126,8 @@ struct DownloadPane: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     @AppStorage(Prefs.Key.watchClipboard) private var watchClipboard = true
+    // Observed, not read through Prefs: the status bar named the old folder until relaunch.
+    @AppStorage(Prefs.Key.downloadDir) private var downloadDir = ""
 
     @State private var urlText = ""
     @State private var pending: String?
@@ -139,6 +141,7 @@ struct DownloadPane: View {
     @State private var ffmpegInstalled = YTDLP.isFFmpegInstalled
     @State private var jsRuntimeInstalled = YTDLP.isJSRuntimeInstalled
     @State private var ffmpegDismissed = false
+    @State private var jsRuntimeDismissed = false
     @State private var installer = ToolInstaller()
     @State private var pasteboardCount = NSPasteboard.general.changeCount
     @FocusState private var urlFocused: Bool
@@ -178,7 +181,7 @@ struct DownloadPane: View {
         .safeAreaInset(edge: .top, spacing: 0) { banners }
         .safeAreaInset(edge: .bottom, spacing: 0) { statusBar }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let first = urls.first else { return false }
+            guard toolInstalled, let first = urls.first else { return false }
             pending = first.absoluteString
             return true
         } isTargeted: { isDropTarget = $0 }
@@ -214,6 +217,7 @@ struct DownloadPane: View {
                 Button("") { pasteAndDownload() }.keyboardShortcut("v", modifiers: [.command, .shift])
             }
             .opacity(0)
+            .accessibilityHidden(true)   // two unlabeled buttons, otherwise, to VoiceOver
         }
     }
 
@@ -244,8 +248,9 @@ struct DownloadPane: View {
         }
         ToolbarItem {
             Menu("More", systemImage: "ellipsis") {
+                // Not bound here: a toolbar menu's shortcuts only fire while it is open.
+                // ⇧⌘V lives on the hidden button below, once.
                 Button("Paste and Download") { pasteAndDownload() }
-                    .keyboardShortcut("v", modifiers: [.command, .shift])
                 Button("Open Downloads Folder") { openDownloadsFolder() }
                 Divider()
                 Button("Pause All") { queue.pauseAll() }
@@ -264,22 +269,24 @@ struct DownloadPane: View {
             if !toolInstalled, !queue.jobs.isEmpty {
                 NoticeBanner(icon: "exclamationmark.triangle.fill", tint: .orange,
                              title: "yt-dlp not found",
-                             message: "Nothing can download until it is installed.",
-                             command: "brew install yt-dlp")
+                             message: installMessage("Nothing can download until it is installed."),
+                             command: "brew install yt-dlp",
+                             install: installer.isBusy ? nil : { runInstall() })
             }
-            if toolInstalled, !jsRuntimeInstalled {
+            if toolInstalled, !jsRuntimeInstalled, !jsRuntimeDismissed {
                 NoticeBanner(icon: "exclamationmark.triangle.fill", tint: .orange,
                              title: "JavaScript runtime not found",
-                             message: "YouTube signs its formats behind a JS challenge; without one, only thumbnails are available.",
+                             message: installMessage("YouTube signs its formats behind a JS challenge; without one, only thumbnails are available."),
                              command: "brew install deno",
-                             install: { runInstall() })
+                             install: installer.isBusy ? nil : { runInstall() },
+                             onDismiss: { jsRuntimeDismissed = true })
             }
             if toolInstalled, !ffmpegInstalled, !ffmpegDismissed {
                 NoticeBanner(icon: "exclamationmark.triangle.fill", tint: .orange,
                              title: "ffmpeg not found",
-                             message: "Merging video with audio, extracting audio and embedding all need it.",
+                             message: installMessage("Merging video with audio, extracting audio and embedding all need it."),
                              command: "brew install ffmpeg",
-                             install: { runInstall() },
+                             install: installer.isBusy ? nil : { runInstall() },
                              onDismiss: { ffmpegDismissed = true })
             }
             if ytdlpOutdated, let latest = ytdlpLatest, !staleDismissed {
@@ -287,7 +294,7 @@ struct DownloadPane: View {
                              title: "yt-dlp \(latest) is available",
                              message: updateMessage,
                              command: YTDLP.updateCommand,
-                             install: YTDLP.updateCommand == nil && !ytdlpUpdating ? { runUpdate() } : nil,
+                             install: YTDLP.updateCommand == nil && !installer.isBusy ? { runUpdate() } : nil,
                              installLabel: "Update",
                              onDismiss: { staleDismissed = true })
             }
@@ -309,7 +316,7 @@ struct DownloadPane: View {
             }
             Spacer()
             Button(action: openDownloadsFolder) {
-                Label(URL(fileURLWithPath: Prefs.string(Prefs.Key.downloadDir)).lastPathComponent,
+                Label(URL(fileURLWithPath: downloadDir).lastPathComponent,
                       systemImage: "folder")
             }
             .buttonStyle(.link)
@@ -365,6 +372,17 @@ struct DownloadPane: View {
         }
     }
 
+    /// The ffmpeg and deno banners share one install. They used to keep repeating the ask
+    /// through a ~90 MB download, and say nothing when it failed.
+    private func installMessage(_ ask: String) -> String {
+        guard !ytdlpUpdating else { return ask }
+        switch installer.phase {
+        case let .working(label, fraction): return "\(label)… \(Int(fraction * 100))%"
+        case let .failed(message): return message
+        default: return ask
+        }
+    }
+
     /// The installer's phase is shared with the ffmpeg and deno banners, so progress is
     /// only this banner's to show while its own update runs.
     private var updateMessage: String {
@@ -405,8 +423,10 @@ struct DownloadPane: View {
     // MARK: - Actions
 
     private func submit() {
+        // Return in the field skipped the button's check and opened a sheet that could
+        // only say yt-dlp is missing.
+        guard canAdd else { return }
         let trimmed = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
         pending = trimmed
         urlText = ""
     }
@@ -436,7 +456,7 @@ struct DownloadPane: View {
     }
 
     private func openDownloadsFolder() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: Prefs.string(Prefs.Key.downloadDir)))
+        NSWorkspace.shared.open(URL(fileURLWithPath: downloadDir))
     }
 
     private func copyToPasteboard(_ text: String) {

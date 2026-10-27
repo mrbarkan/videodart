@@ -206,7 +206,7 @@ struct AddSheet: View {
 
                 Text(cookieSource == "none"
                      ? "Pick the browser you are signed into that site with."
-                     : "Quit \(cookieSource.capitalized) first — it locks its cookie database while running.")
+                     : "Sign in to that site in \(cookieSource.capitalized), then try again.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)

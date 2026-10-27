@@ -56,13 +56,30 @@ enum YTDLP {
     /// YouTube's format URLs are behind a JS challenge; without a runtime yt-dlp can
     /// only see thumbnails. deno is yt-dlp's recommended one.
     static var jsRuntimePath: String? {
-        ["/opt/homebrew/bin/deno", "/usr/local/bin/deno", ToolInstaller.managedDeno]
+        ["/opt/homebrew/bin/deno", "/usr/local/bin/deno", NSHomeDirectory() + "/.deno/bin/deno",
+         ToolInstaller.managedDeno]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     static var isJSRuntimeInstalled: Bool { jsRuntimePath != nil }
 
     static let archiveURL = AppSupport.file("archive.txt")
+    /// The archive records a video's id whatever was fetched, so "Both, split" — two jobs,
+    /// one id — finished whichever ran second as "Already downloaded", with no file.
+    /// Audio keeps its own record.
+    static let audioArchiveURL = AppSupport.file("archive-audio.txt")
+    static func archive(for kind: MediaKind) -> URL { kind == .audio ? audioArchiveURL : archiveURL }
+
+    static let defaultFilenameTemplate = "%(title)s [%(id)s].%(ext)s"
+
+    /// yt-dlp's --limit-rate syntax ("500K", "2.5M"), forgiving of a space and lowercase.
+    /// Anything else is dropped rather than passed on: a typo there failed every job.
+    static func rateLimit(_ text: String) -> String? {
+        let compact = text.replacingOccurrences(of: " ", with: "").uppercased()
+        guard compact.range(of: #"^\d+(\.\d+)?[KMG]?$"#, options: .regularExpression) != nil,
+              (Double(compact.trimmingCharacters(in: .letters)) ?? 0) > 0 else { return nil }
+        return compact
+    }
 
     /// yt-dlp ships dated releases (2026.08.19). A stale copy is the single most common
     /// cause of YouTube extraction failures — but age alone says nothing: yt-dlp can go
@@ -171,10 +188,12 @@ enum YTDLP {
             + "|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str,progress._total_bytes_estimate_str)s",
             "--print", "after_move:FILE|%(filepath)s",
             "-P", job.destination,
-            "-o", Prefs.string(Prefs.Key.filenameTemplate),
+            // A cleared field stores "", and `-o ""` names nothing.
+            "-o", Prefs.string(Prefs.Key.filenameTemplate).trimmingCharacters(in: .whitespaces).isEmpty
+                ? defaultFilenameTemplate : Prefs.string(Prefs.Key.filenameTemplate),
             "--continue", "-N", "4",
         ]
-        if Prefs.bool(Prefs.Key.useArchive) { a += ["--download-archive", archiveURL.path] }
+        if Prefs.bool(Prefs.Key.useArchive) { a += ["--download-archive", archive(for: job.kind).path] }
         // PATH alone is not enough when ffmpeg lives in Application Support.
         if let ffmpeg = ffmpegPath { a += ["--ffmpeg-location", ffmpeg] }
         if let deno = jsRuntimePath, deno == ToolInstaller.managedDeno {
@@ -182,8 +201,14 @@ enum YTDLP {
         }
         a += cookieArguments()
 
-        let limit = Prefs.string(Prefs.Key.rateLimit)
-        if !limit.isEmpty { a += ["--limit-rate", limit] }
+        if let limit = rateLimit(Prefs.string(Prefs.Key.rateLimit)) { a += ["--limit-rate", limit] }
+
+        // "MP4" should mean a file QuickTime plays. Left to its default ranking yt-dlp
+        // picks AV1 or VP9 with Opus and copies them into the MP4 untouched. Resolution
+        // still ranks first, so asking for 4K still gets 4K; at each size H.264 and AAC win.
+        if job.kind != .audio, ["mp4", "mov"].contains(job.container) {
+            a += ["-S", "res,vcodec:h264,acodec:m4a"]
+        }
 
         switch job.kind {
         case .audio:
@@ -226,7 +251,9 @@ enum YTDLP {
     /// One shot metadata read. `--flat-playlist` keeps playlists fast; a single video still
     /// comes back fully populated.
     static func probe(_ url: String) async throws -> MediaInfo {
-        var args = ["--dump-single-json", "--flat-playlist", "--ignore-config", url]
+        // --no-playlist as the download has: a watch link copied from inside a playlist
+        // or a YouTube Mix means that video. A plain playlist link is still a playlist.
+        var args = ["--dump-single-json", "--flat-playlist", "--no-playlist", "--ignore-config", url]
         args.insert(contentsOf: cookieArguments(), at: 0)
         let (out, err, status) = try await capture(args)
         guard status == 0, let data = out.data(using: .utf8),
@@ -292,8 +319,15 @@ enum YTDLP {
                     cont.resume(throwing: YTError(message: "Could not run \(executablePath): \(error.localizedDescription)"))
                     return
                 }
+                // Drain stderr alongside stdout: read one after the other, a full stderr
+                // pipe stalls yt-dlp while stdout waits for an EOF that never comes.
+                nonisolated(unsafe) var e = Data()
+                let drained = DispatchGroup()
+                DispatchQueue.global().async(group: drained) {
+                    e = (try? err.fileHandleForReading.readToEnd()) ?? Data()
+                }
                 let o = (try? out.fileHandleForReading.readToEnd()) ?? Data()
-                let e = (try? err.fileHandleForReading.readToEnd()) ?? Data()
+                drained.wait()
                 p.waitUntilExit()
                 cont.resume(returning: (String(decoding: o, as: UTF8.self),
                                         String(decoding: e, as: UTF8.self),
@@ -369,18 +403,12 @@ enum YTDLP {
         p.standardError = err
 
         let (stream, cont) = AsyncStream<YTEvent>.makeStream(bufferingPolicy: .unbounded)
-        LineReader.attach(out.fileHandleForReading, cont) { event(from: $0) }
-        LineReader.attach(err.fileHandleForReading, cont) { event(from: $0) }
+        let drained = DispatchGroup()
+        LineReader.attach(out.fileHandleForReading, cont, drained) { event(from: $0) }
+        LineReader.attach(err.fileHandleForReading, cont, drained) { event(from: $0) }
 
         p.terminationHandler = { proc in
-            for h in [out.fileHandleForReading, err.fileHandleForReading] {
-                h.readabilityHandler = nil
-                if let rest = try? h.readToEnd(), !rest.isEmpty {
-                    for line in String(decoding: rest, as: UTF8.self).split(whereSeparator: \.isNewline) {
-                        cont.yield(event(from: String(line)))
-                    }
-                }
-            }
+            LineReader.finish(drained, [out.fileHandleForReading, err.fileHandleForReading])
             cont.yield(.exited(proc.terminationStatus))
             cont.finish()
         }
@@ -430,13 +458,27 @@ enum LineReader {
 
     /// `parse` returning nil drops the line — ffmpeg's `-progress` output is mostly keys
     /// that mean nothing until the block terminator arrives.
+    ///
+    /// Each reader leaves `drained` at EOF, after flushing a last line that had no newline.
+    /// The exit event waits on that: it used to cut the readers off and read the rest
+    /// itself, which raced a handler already running and could drop the `FILE|` line or
+    /// deliver a progress tick after the exit.
     static func attach<E: Sendable>(_ handle: FileHandle,
                                     _ cont: AsyncStream<E>.Continuation,
+                                    _ drained: DispatchGroup,
                                     _ parse: @escaping @Sendable (String) -> E?) {
         let box = Box()
+        drained.enter()
         handle.readabilityHandler = { fh in
             let chunk = fh.availableData
-            guard !chunk.isEmpty else { fh.readabilityHandler = nil; return }
+            guard !chunk.isEmpty else {
+                fh.readabilityHandler = nil
+                let last = String(decoding: box.buffer, as: UTF8.self)
+                box.buffer.removeAll()
+                if !last.isEmpty, let event = parse(last) { cont.yield(event) }
+                drained.leave()
+                return
+            }
             box.buffer.append(chunk)
             // yt-dlp uses \n with --newline, but postprocessors still emit \r.
             while let i = box.buffer.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
@@ -444,6 +486,14 @@ enum LineReader {
                 box.buffer.removeSubrange(...i)
                 if !line.isEmpty, let event = parse(line) { cont.yield(event) }
             }
+        }
+    }
+
+    /// Called from a termination handler. A grandchild (yt-dlp's ffmpeg) can hold a pipe
+    /// open past the exit, so the wait is bounded; past it the readers are cut off.
+    static func finish(_ drained: DispatchGroup, _ handles: [FileHandle]) {
+        if drained.wait(timeout: .now() + 5) == .timedOut {
+            for h in handles { h.readabilityHandler = nil }
         }
     }
 }

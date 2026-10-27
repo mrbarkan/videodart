@@ -57,6 +57,27 @@ enum SelfCheck {
         assert(!YTDLP.arguments(for: original).contains("--merge-output-format"),
                "\"keep original\" must not force a container")
 
+        // "MP4" means QuickTime plays it: H.264 and AAC win at each resolution, but
+        // resolution still ranks first. Audio and other containers keep yt-dlp's ranking.
+        assert(adjacent(video, ["-S", "res,vcodec:h264,acodec:m4a"]), "MP4 must prefer H.264 + AAC")
+        assert(!audioArgs.contains("-S"), "audio picks its own codec")
+        assert(!YTDLP.arguments(for: original).contains("-S"), "\"keep original\" means as uploaded")
+
+        // Both halves of "Both, split" share a video id; one archive file made whichever
+        // ran second finish as "Already downloaded", with no file.
+        assert(YTDLP.archive(for: .audio) != YTDLP.archive(for: .videoAudio))
+        assert(YTDLP.archive(for: .video) == YTDLP.archive(for: .videoAudio))
+
+        // Speed limit: yt-dlp's syntax, forgiving of a space and case; anything else is
+        // dropped, because passing it on failed every job.
+        assert(YTDLP.rateLimit("2M") == "2M")
+        assert(YTDLP.rateLimit(" 500 k") == "500K")
+        assert(YTDLP.rateLimit("2.5M") == "2.5M")
+        assert(YTDLP.rateLimit("1000") == "1000")
+        assert(YTDLP.rateLimit("2 MB/s") == nil, "a unit yt-dlp rejects must not be passed on")
+        assert(YTDLP.rateLimit("0") == nil, "zero is not a limit")
+        assert(YTDLP.rateLimit("") == nil)
+
         // Error extraction strips yt-dlp's CLI hints, wiki links and "[extractor] id:" prefix.
         let raw = """
         [youtube] Extracting URL

@@ -65,15 +65,21 @@ struct VideoDartApp: App {
                     .keyboardShortcut("c", modifiers: [.command, .shift])
             }
             CommandGroup(before: .toolbar) {
-                Picker("View", selection: Bindable(navigator).pane) {
-                    ForEach(Navigator.Pane.allCases) { Text($0.label).tag($0) }
+                // Toggles rather than an inline Picker: a picker's items can't carry the
+                // ⌘1 / ⌘2 the segmented control's tooltip has always promised.
+                ForEach(Array(Navigator.Pane.allCases.enumerated()), id: \.element) { index, pane in
+                    Toggle(pane.label, isOn: Binding(
+                        get: { navigator.pane == pane },
+                        set: { if $0 { navigator.pane = pane } }))
+                    .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
                 }
-                .pickerStyle(.inline)
                 Divider()
             }
             CommandMenu("Downloads") {
+                // Not ⌘. — that is Cancel everywhere on the Mac, and pressed to dismiss the
+                // Add sheet it paused every download instead.
                 Button("Pause All") { queue.pauseAll() }
-                    .keyboardShortcut(".", modifiers: .command)
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
                 Button("Resume All") { queue.resumeAll() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                 Divider()

@@ -41,7 +41,7 @@ struct SettingsView: View {
                         Button("Choose…") { pickFolder() }
                     }
                 }
-                TextField("Filename", text: $filenameTemplate)
+                TextField("Filename", text: $filenameTemplate, prompt: Text(YTDLP.defaultFilenameTemplate))
                     .help("yt-dlp output template, e.g. %(title)s [%(id)s].%(ext)s")
                 Stepper("Simultaneous downloads: \(maxConcurrent)", value: $maxConcurrent, in: 1...6)
             }
@@ -65,10 +65,12 @@ struct SettingsView: View {
                         HStack {
                             Text("\(archiveCount) video\(archiveCount == 1 ? "" : "s")")
                             Button("Show File") {
-                                NSWorkspace.shared.activateFileViewerSelecting([YTDLP.archiveURL])
+                                NSWorkspace.shared.activateFileViewerSelecting(Self.archives.filter {
+                                    FileManager.default.fileExists(atPath: $0.path)
+                                })
                             }
                             Button("Forget All") {
-                                try? FileManager.default.removeItem(at: YTDLP.archiveURL)
+                                for url in Self.archives { try? FileManager.default.removeItem(at: url) }
                                 archiveCount = 0
                             }
                             .disabled(archiveCount == 0)
@@ -85,9 +87,13 @@ struct SettingsView: View {
         .formStyle(.grouped)
     }
 
+    /// Audio downloads keep their own record, so "Both, split" can fetch both halves.
+    private static let archives = [YTDLP.archiveURL, YTDLP.audioArchiveURL]
+
     private static func countArchive() -> Int {
-        guard let text = try? String(contentsOf: YTDLP.archiveURL, encoding: .utf8) else { return 0 }
-        return text.split(whereSeparator: \.isNewline).count
+        Set(archives.flatMap { url in
+            ((try? String(contentsOf: url, encoding: .utf8)) ?? "").split(whereSeparator: \.isNewline)
+        }).count
     }
 
     private var account: some View {
@@ -131,7 +137,7 @@ struct SettingsView: View {
         case "file":
             "Export cookies.txt from a browser extension while signed in to YouTube."
         default:
-            "Quit \(cookieSource.capitalized) before downloading — it locks its cookie database while running. macOS may ask for Keychain access the first time."
+            "Use the \(cookieSource.capitalized) profile you're signed in with. macOS may ask for Keychain access the first time."
         }
     }
 
@@ -149,12 +155,29 @@ struct SettingsView: View {
                 TextField("Speed limit", text: $rateLimit, prompt: Text("Unlimited"))
                     .help("e.g. 2M or 500K")
             } footer: {
-                Text("Update with `brew upgrade yt-dlp`. ffmpeg is required for merging, audio extraction and embedding.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    // Unreadable limits are dropped rather than passed on, which failed
+                    // every job — so say so, or "2 MB/s" would look applied.
+                    if !rateLimit.trimmingCharacters(in: .whitespaces).isEmpty, YTDLP.rateLimit(rateLimit) == nil {
+                        Text("Speed limit not understood — use a number with K, M or G, like 500K or 2M. Downloads run unlimited until then.")
+                            .foregroundStyle(.orange)
+                    }
+                    Text(LocalizedStringKey(updateHint + " ffmpeg is required for merging, audio extraction and embedding."))
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)
+    }
+
+    /// The command that updates the copy in use; `brew upgrade` was named for every copy.
+    private var updateHint: String {
+        guard let command = YTDLP.updateCommand else {
+            return "VideoDart updates its own copy from the banner when a new release is out."
+        }
+        return "Update with `\(command)`."
     }
 
     // MARK: - Panels

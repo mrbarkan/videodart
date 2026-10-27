@@ -276,18 +276,12 @@ enum FFmpeg {
         // -progress writes key=value blocks to stdout; the banner carrying Duration goes
         // to stderr. Two parsers, one line reader — the same one yt-dlp's output uses.
         let progress = ProgressAccumulator()
-        LineReader.attach(out.fileHandleForReading, cont) { progress.consume($0) }
-        LineReader.attach(err.fileHandleForReading, cont) { banner(from: $0) }
+        let drained = DispatchGroup()
+        LineReader.attach(out.fileHandleForReading, cont, drained) { progress.consume($0) }
+        LineReader.attach(err.fileHandleForReading, cont, drained) { banner(from: $0) }
 
         p.terminationHandler = { proc in
-            for h in [out.fileHandleForReading, err.fileHandleForReading] {
-                h.readabilityHandler = nil
-                if let rest = try? h.readToEnd(), !rest.isEmpty {
-                    for line in String(decoding: rest, as: UTF8.self).split(whereSeparator: \.isNewline) {
-                        if let event = banner(from: String(line)) { cont.yield(event) }
-                    }
-                }
-            }
+            LineReader.finish(drained, [out.fileHandleForReading, err.fileHandleForReading])
             cont.yield(.exited(proc.terminationStatus))
             cont.finish()
         }
