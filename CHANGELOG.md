@@ -3,6 +3,16 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## 0.6.1 (Beta), 2026-10-27
+
+### Fixed
+
+- **The yt-dlp banner no longer asks Homebrew users for an update Homebrew doesn't have
+  yet.** Homebrew publishes yt-dlp a day or two after GitHub, so `brew upgrade` had nothing
+  to install. A Homebrew copy is now compared with Homebrew's own latest version.
+- **The download window keeps its layout with an empty queue.** The banner and status bar
+  floated in the middle of the window instead of sitting at the top and bottom.
+
 ## 0.6.0 (Beta), 2026-10-27
 
 ### Changed
