@@ -13,6 +13,8 @@ enum Prefs {
         static let cookieProfile = "cookieProfile"
         static let cookieFile = "cookieFile"
         static let ytdlpPath = "ytdlpPath"
+        static let ytdlpLatest = "ytdlpLatest"
+        static let ytdlpLatestCheckedAt = "ytdlpLatestCheckedAt"
         static let subLangs = "subLangs"
         static let rateLimit = "rateLimit"
         static let useArchive = "useArchive"

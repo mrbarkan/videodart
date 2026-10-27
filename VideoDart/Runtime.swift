@@ -88,10 +88,10 @@ final class ToolInstaller {
     }
 
     /// Replaces the managed yt-dlp with the current release. ffmpeg is left alone —
-    /// it is not the part that rots.
+    /// it is not the part that rots. `fetch` swaps the file only once the download has
+    /// landed, so a failed update leaves the working copy in place.
     func updateYTDLP() async {
         do {
-            try? FileManager.default.removeItem(atPath: Self.managedYTDLP)
             try await fetch(Self.ytdlpSource, to: Self.managedYTDLP,
                             label: "Updating yt-dlp", gzipped: false)
             phase = .done

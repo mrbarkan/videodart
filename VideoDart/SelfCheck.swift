@@ -137,16 +137,17 @@ enum SelfCheck {
         assert(restored?.first?.size == "", "a field added later must fall back to its default")
         assert(restored?.first?.title == "Old Job", "existing values must survive")
 
-        // yt-dlp's dated version string drives the staleness banner.
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.dateFormat = "yyyy.MM.dd"
-        let thirtyDaysAgo = formatter.string(from: Date().addingTimeInterval(-30 * 86_400))
-        assert(YTDLP.versionAge(thirtyDaysAgo) == 30, "expected 30, got \(String(describing: YTDLP.versionAge(thirtyDaysAgo)))")
+        // The update banner compares dated versions; age alone used to nag about a copy
+        // that was already the newest release.
+        assert(YTDLP.isBehind("2026.07.01", latest: "2026.08.19"), "older release must be behind")
+        assert(!YTDLP.isBehind("2026.08.19", latest: "2026.08.19"), "the latest release is current, however old")
+        assert(YTDLP.isBehind("2025.12.31", latest: "2026.01.02"), "year boundary must compare numerically")
+        assert(YTDLP.isBehind("2026.08.09", latest: "2026.08.10"), "components compare as numbers, not text")
         // Nightly builds carry a fourth component; it must not defeat the parse.
-        assert(YTDLP.versionAge(thirtyDaysAgo + ".232355") == 30, "nightly suffix must be ignored")
-        assert(YTDLP.versionAge("not a version") == nil, "unparseable version must not warn")
+        assert(!YTDLP.isBehind("2026.08.19.232355", latest: "2026.08.19"), "same-day nightly is current")
+        assert(!YTDLP.isBehind("2026.08.20.010203", latest: "2026.08.19"), "a newer nightly is current")
+        assert(!YTDLP.isBehind("not a version", latest: "2026.08.19"), "unparseable version must not warn")
+        assert(!YTDLP.isBehind("2026.08.19", latest: ""), "an unknown latest must not warn")
 
         convert()
     }

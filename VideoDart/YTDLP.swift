@@ -65,17 +65,55 @@ enum YTDLP {
     static let archiveURL = AppSupport.file("archive.txt")
 
     /// yt-dlp ships dated releases (2026.08.19). A stale copy is the single most common
-    /// cause of YouTube extraction failures, so the age is worth surfacing.
-    static func versionAge(_ version: String) -> Int? {
-        let trimmed = version.split(separator: ".").prefix(3).joined(separator: ".")
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        formatter.dateFormat = "yyyy.MM.dd"
-        guard let released = formatter.date(from: trimmed) else { return nil }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-        return calendar.dateComponents([.day], from: released, to: Date()).day
+    /// cause of YouTube extraction failures — but age alone says nothing: yt-dlp can go
+    /// weeks between releases, and the banner used to nag about a copy that was already
+    /// the latest. So it compares against the newest release instead.
+    static func isBehind(_ installed: String, latest: String) -> Bool {
+        guard let have = releaseDate(installed), let want = releaseDate(latest) else { return false }
+        return have.lexicographicallyPrecedes(want)
+    }
+
+    /// The first three components as numbers. A nightly's fourth is a build time, so a
+    /// nightly from the same day as the stable release counts as current.
+    private static func releaseDate(_ version: String) -> [Int]? {
+        let parts = version.split(separator: ".").prefix(3).compactMap { Int($0) }
+        return parts.count == 3 ? parts : nil
+    }
+
+    /// The newest stable tag, asked of GitHub at most once a day — the unauthenticated
+    /// API allows 60 requests an hour. Offline, it falls back to the last answer, or nil,
+    /// and the banner stays quiet rather than guess.
+    static func latestRelease() async -> String? {
+        let defaults = UserDefaults.standard
+        let cached = defaults.string(forKey: Prefs.Key.ytdlpLatest)
+        let checkedAt = defaults.double(forKey: Prefs.Key.ytdlpLatestCheckedAt)
+        if cached != nil, Date().timeIntervalSince1970 - checkedAt < 86_400 { return cached }
+
+        struct Release: Decodable { let tagName: String }
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")!)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 15
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let tag = try? decoder.decode(Release.self, from: data).tagName
+        else { return cached }
+        defaults.set(tag, forKey: Prefs.Key.ytdlpLatest)
+        defaults.set(Date().timeIntervalSince1970, forKey: Prefs.Key.ytdlpLatestCheckedAt)
+        return tag
+    }
+
+    /// The command that updates the copy in use — nil for the app's own copy, which the
+    /// banner updates in place. `brew upgrade` can't touch anything else, and `-U` can't
+    /// touch a Homebrew install, so the banner must offer the one that works.
+    static var updateCommand: String? {
+        let path = executablePath
+        if path == ToolInstaller.managedYTDLP { return nil }
+        if URL(fileURLWithPath: path).resolvingSymlinksInPath().path.contains("/Cellar/") {
+            return "brew upgrade yt-dlp"
+        }
+        return "'\(path)' -U"
     }
 
     /// GUI apps inherit a bare PATH, so yt-dlp would not find ffmpeg. Hand it one that works.

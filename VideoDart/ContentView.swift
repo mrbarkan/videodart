@@ -82,6 +82,7 @@ private struct NoticeBanner: View {
     let message: String
     var command: String? = nil
     var install: (() -> Void)? = nil
+    var installLabel = "Install"
     var onDismiss: (() -> Void)? = nil
 
     var body: some View {
@@ -94,7 +95,7 @@ private struct NoticeBanner: View {
                 }
                 Spacer(minLength: 8)
                 if let install {
-                    Button("Install", action: install).controlSize(.small)
+                    Button(installLabel, action: install).controlSize(.small)
                 }
                 if let command {
                     Button("Copy Command") {
@@ -129,7 +130,10 @@ struct DownloadPane: View {
     @State private var urlText = ""
     @State private var pending: String?
     @State private var isDropTarget = false
-    @State private var ytdlpAge: Int?
+    @State private var ytdlpVersion: String?
+    @State private var ytdlpLatest: String?
+    @State private var ytdlpUpdating = false
+    @State private var ytdlpUpdateError: String?
     @State private var staleDismissed = false
     @State private var toolInstalled = YTDLP.isInstalled
     @State private var ffmpegInstalled = YTDLP.isFFmpegInstalled
@@ -144,6 +148,10 @@ struct DownloadPane: View {
     private var quick: Animation? { reduceMotion ? nil : .smooth(duration: 0.18) }
     // Nothing can be queued without the tool, so the button must not invite the attempt.
     private var canAdd: Bool { toolInstalled && !urlText.trimmingCharacters(in: .whitespaces).isEmpty }
+    private var ytdlpOutdated: Bool {
+        guard let installed = ytdlpVersion, let latest = ytdlpLatest else { return false }
+        return YTDLP.isBehind(installed, latest: latest)
+    }
 
     var body: some View {
         Group {
@@ -271,11 +279,13 @@ struct DownloadPane: View {
                              install: { runInstall() },
                              onDismiss: { ffmpegDismissed = true })
             }
-            if let days = ytdlpAge, days > 14, !staleDismissed {
+            if ytdlpOutdated, let latest = ytdlpLatest, !staleDismissed {
                 NoticeBanner(icon: "exclamationmark.triangle.fill", tint: .orange,
-                             title: "yt-dlp is \(days) days old",
-                             message: "YouTube changes often — a stale copy is the usual cause of failures.",
-                             command: "brew upgrade yt-dlp",
+                             title: "yt-dlp \(latest) is available",
+                             message: updateMessage,
+                             command: YTDLP.updateCommand,
+                             install: YTDLP.updateCommand == nil && !ytdlpUpdating ? { runUpdate() } : nil,
+                             installLabel: "Update",
                              onDismiss: { staleDismissed = true })
             }
         }
@@ -352,6 +362,27 @@ struct DownloadPane: View {
         }
     }
 
+    /// The installer's phase is shared with the ffmpeg and deno banners, so progress is
+    /// only this banner's to show while its own update runs.
+    private var updateMessage: String {
+        if ytdlpUpdating, case let .working(label, fraction) = installer.phase {
+            return "\(label)… \(Int(fraction * 100))%"
+        }
+        if let ytdlpUpdateError { return ytdlpUpdateError }
+        return "You have \(ytdlpVersion ?? "an older version"). YouTube changes often — an outdated copy is the usual cause of failures."
+    }
+
+    private func runUpdate() {
+        Task {
+            ytdlpUpdating = true
+            await installer.updateYTDLP()
+            if case let .failed(message) = installer.phase { ytdlpUpdateError = message } else { ytdlpUpdateError = nil }
+            ytdlpUpdating = false
+            ytdlpVersion = nil
+            await refreshTooling()
+        }
+    }
+
     /// Re-read tool availability. Called on launch and on every activation, so installing
     /// yt-dlp in a terminal and switching back updates the window without a relaunch.
     private func refreshTooling() async {
@@ -359,9 +390,13 @@ struct DownloadPane: View {
         toolInstalled = YTDLP.isInstalled
         ffmpegInstalled = YTDLP.isFFmpegInstalled
         jsRuntimeInstalled = YTDLP.isJSRuntimeInstalled
-        if toolInstalled, ytdlpAge == nil || !wasInstalled {
-            ytdlpAge = YTDLP.versionAge(await YTDLP.version())
+        // Re-read while behind too, so `brew upgrade` in a terminal clears the banner
+        // on switching back.
+        if toolInstalled, ytdlpVersion == nil || !wasInstalled || ytdlpOutdated {
+            ytdlpVersion = await YTDLP.version()
         }
+        // Cheap on every activation: GitHub is asked at most once a day.
+        if toolInstalled { ytdlpLatest = await YTDLP.latestRelease() }
     }
 
     // MARK: - Actions
