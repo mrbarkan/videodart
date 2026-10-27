@@ -159,6 +159,14 @@ enum SelfCheck {
         assert(!YTDLP.isBehind("2026.08.20.010203", latest: "2026.08.19"), "a newer nightly is current")
         assert(!YTDLP.isBehind("not a version", latest: "2026.08.19"), "unparseable version must not warn")
         assert(!YTDLP.isBehind("2026.08.19", latest: ""), "an unknown latest must not warn")
+        // Both feeds, trimmed from verbatim responses. A Homebrew copy is measured against
+        // the formula, not GitHub: brew trails by a day or two and can't install what it
+        // doesn't have yet.
+        let formula = #"{"name":"yt-dlp","versions":{"stable":"2026.10.21","head":"HEAD","bottle":true},"revision":1}"#
+        assert(YTDLP.formulaVersion(Data(formula.utf8)) == "2026.10.21", "Homebrew's stable version")
+        let release = #"{"tag_name":"2026.10.26","name":"yt-dlp 2026.10.26","prerelease":false}"#
+        assert(YTDLP.releaseTag(Data(release.utf8)) == "2026.10.26", "GitHub's release tag")
+        assert(YTDLP.formulaVersion(Data(release.utf8)) == nil, "the wrong feed must not parse as the right one")
 
         convert()
     }

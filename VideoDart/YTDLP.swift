@@ -80,28 +80,52 @@ enum YTDLP {
         return parts.count == 3 ? parts : nil
     }
 
-    /// The newest stable tag, asked of GitHub at most once a day — the unauthenticated
-    /// API allows 60 requests an hour. Offline, it falls back to the last answer, or nil,
+    /// The newest release the copy in use can actually update to, asked at most once a
+    /// day. A Homebrew copy is compared with Homebrew's formula, which trails GitHub by a
+    /// day or two — measured against GitHub, the banner offered a `brew upgrade` that had
+    /// nothing to install. Everything else updates from GitHub (the unauthenticated API
+    /// allows 60 requests an hour). Offline, it falls back to the last answer, or nil,
     /// and the banner stays quiet rather than guess.
     static func latestRelease() async -> String? {
+        let homebrew = isHomebrew
+        // Keyed by source, so switching between copies never compares against the
+        // other feed's cached answer.
+        let key = Prefs.Key.ytdlpLatest + (homebrew ? ".brew" : "")
+        let checkedKey = Prefs.Key.ytdlpLatestCheckedAt + (homebrew ? ".brew" : "")
         let defaults = UserDefaults.standard
-        let cached = defaults.string(forKey: Prefs.Key.ytdlpLatest)
-        let checkedAt = defaults.double(forKey: Prefs.Key.ytdlpLatestCheckedAt)
-        if cached != nil, Date().timeIntervalSince1970 - checkedAt < 86_400 { return cached }
+        let cached = defaults.string(forKey: key)
+        if cached != nil, Date().timeIntervalSince1970 - defaults.double(forKey: checkedKey) < 86_400 {
+            return cached
+        }
 
-        struct Release: Decodable { let tagName: String }
-        var request = URLRequest(url: URL(string: "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")!)
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        var request = URLRequest(url: URL(string: homebrew
+            ? "https://formulae.brew.sh/api/formula/yt-dlp.json"
+            : "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")!)
+        if !homebrew { request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept") }
         request.timeoutInterval = 15
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
         guard let (data, response) = try? await URLSession.shared.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
-              let tag = try? decoder.decode(Release.self, from: data).tagName
+              let latest = homebrew ? formulaVersion(data) : releaseTag(data)
         else { return cached }
-        defaults.set(tag, forKey: Prefs.Key.ytdlpLatest)
-        defaults.set(Date().timeIntervalSince1970, forKey: Prefs.Key.ytdlpLatestCheckedAt)
-        return tag
+        defaults.set(latest, forKey: key)
+        defaults.set(Date().timeIntervalSince1970, forKey: checkedKey)
+        return latest
+    }
+
+    static func releaseTag(_ data: Data) -> String? {
+        struct Release: Decodable { let tagName: String }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try? decoder.decode(Release.self, from: data).tagName
+    }
+
+    static func formulaVersion(_ data: Data) -> String? {
+        struct Formula: Decodable { struct Versions: Decodable { let stable: String }; let versions: Versions }
+        return try? JSONDecoder().decode(Formula.self, from: data).versions.stable
+    }
+
+    private static var isHomebrew: Bool {
+        URL(fileURLWithPath: executablePath).resolvingSymlinksInPath().path.contains("/Cellar/")
     }
 
     /// The command that updates the copy in use — nil for the app's own copy, which the
@@ -110,9 +134,7 @@ enum YTDLP {
     static var updateCommand: String? {
         let path = executablePath
         if path == ToolInstaller.managedYTDLP { return nil }
-        if URL(fileURLWithPath: path).resolvingSymlinksInPath().path.contains("/Cellar/") {
-            return "brew upgrade yt-dlp"
-        }
+        if isHomebrew { return "brew upgrade yt-dlp" }
         return "'\(path)' -U"
     }
 
