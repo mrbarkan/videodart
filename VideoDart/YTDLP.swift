@@ -51,7 +51,17 @@ enum YTDLP {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    static var isFFmpegInstalled: Bool { ffmpegPath != nil }
+    static var isFFmpegInstalled: Bool { ffmpegPath != nil && !hidden("ffmpeg") }
+
+    #if DEBUG
+    /// VD_HIDE_TOOLS=ffmpeg,deno makes the window act as if they were missing, so the
+    /// install banners can be exercised on a Mac that has them.
+    private static func hidden(_ tool: String) -> Bool {
+        ProcessInfo.processInfo.environment["VD_HIDE_TOOLS"]?.split(separator: ",").contains(Substring(tool)) == true
+    }
+    #else
+    private static func hidden(_ tool: String) -> Bool { false }
+    #endif
 
     /// YouTube's format URLs are behind a JS challenge; without a runtime yt-dlp can
     /// only see thumbnails. deno is yt-dlp's recommended one.
@@ -61,7 +71,7 @@ enum YTDLP {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    static var isJSRuntimeInstalled: Bool { jsRuntimePath != nil }
+    static var isJSRuntimeInstalled: Bool { jsRuntimePath != nil && !hidden("deno") }
 
     static let archiveURL = AppSupport.file("archive.txt")
     /// The archive records a video's id whatever was fetched, so "Both, split" — two jobs,
