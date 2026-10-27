@@ -17,6 +17,9 @@ struct SettingsView: View {
     @AppStorage(Prefs.Key.watchClipboard) private var watchClipboard = true
 
     @State private var version = "…"
+    // The first text field took focus on open, so Filename sat selected and one stray
+    // keystroke replaced the template.
+    @FocusState private var focused: Bool
     @State private var archiveCount = 0
 
     var body: some View {
@@ -42,6 +45,7 @@ struct SettingsView: View {
                     }
                 }
                 TextField("Filename", text: $filenameTemplate, prompt: Text(YTDLP.defaultFilenameTemplate))
+                    .focused($focused)
                     .help("yt-dlp output template, e.g. %(title)s [%(id)s].%(ext)s")
                 Stepper("Simultaneous downloads: \(maxConcurrent)", value: $maxConcurrent, in: 1...6)
             }
@@ -85,6 +89,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .task { focused = false }
     }
 
     /// Audio downloads keep their own record, so "Both, split" can fetch both halves.
