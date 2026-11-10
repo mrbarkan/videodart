@@ -684,6 +684,23 @@ struct ConvertJob: Identifiable, Hashable {
     }
 }
 
+extension ConvertJob {
+    /// The one way a job is made from a file and what was chosen for it, shared by the
+    /// Convert pane and the agent's `convert` so the two can't drift apart. The probe is
+    /// the part a copy would forget: a size-target preset divides by the duration, and a
+    /// job queued without one goes out at a flat 8 Mbps.
+    ///
+    /// `destination` is the folder preference as stored: "" writes beside the source.
+    init(source: URL, preset: ConvertPreset, probe: FFmpeg.MediaProbe?, destination: String,
+         trimStart: String = "", trimEnd: String = "") {
+        self.init(source: source, preset: preset,
+                  sourceDuration: probe?.duration, sourceBytes: probe?.bytes,
+                  destinationDir: destination.isEmpty ? nil : destination)
+        self.trimStart = trimStart
+        self.trimEnd = trimEnd
+    }
+}
+
 // MARK: - Timecodes
 
 enum Timecode {

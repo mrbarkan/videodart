@@ -122,6 +122,8 @@ private struct NoticeBanner: View {
 
 struct DownloadPane: View {
     @Environment(DownloadQueue.self) private var queue
+    @Environment(Staging.self) private var staging
+    @Environment(Navigator.self) private var navigator
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
@@ -144,6 +146,7 @@ struct DownloadPane: View {
     @State private var jsRuntimeDismissed = false
     @State private var installer = ToolInstaller()
     @State private var pasteboardCount = NSPasteboard.general.changeCount
+    @State private var selection: Set<UUID> = []
     @FocusState private var urlFocused: Bool
 
     /// Critically damped by default — graceful, no overshoot, and silent under Reduce Motion.
@@ -151,6 +154,11 @@ struct DownloadPane: View {
     private var quick: Animation? { reduceMotion ? nil : .smooth(duration: 0.18) }
     // Nothing can be queued without the tool, so the button must not invite the attempt.
     private var canAdd: Bool { toolInstalled && !urlText.trimmingCharacters(in: .whitespaces).isEmpty }
+    /// In the order the list shows them. A selection can outlive its rows, so it is read
+    /// through the queue rather than counted.
+    private func convertible(in ids: Set<UUID>) -> [DownloadJob] {
+        queue.jobs.filter { ids.contains($0.id) && DownloadQueue.isConvertible($0) }
+    }
     private var ytdlpOutdated: Bool {
         guard let installed = ytdlpVersion, let latest = ytdlpLatest else { return false }
         return YTDLP.isBehind(installed, latest: latest)
@@ -167,11 +175,31 @@ struct DownloadPane: View {
                     Text("Paste a link above, drop one onto this window, or press ⇧⌘V.")
                 }
             } else {
-                List {
-                    ForEach(queue.jobs) { JobRow(job: $0) }
+                List(selection: $selection) {
+                    ForEach(queue.jobs) { job in
+                        JobRow(job: job, onConvert: { sendToConvert([job]) })
+                    }
                 }
                 .listStyle(.inset)
                 .animation(settle, value: queue.jobs.map(\.state))
+                // The menu and double-click belong to the list now that it is selectable:
+                // a tap gesture on the row competes with the click that selects it, and a
+                // row's own menu can't speak for a selection of several.
+                .contextMenu(forSelectionType: UUID.self) { ids in
+                    if ids.count == 1, let job = queue.jobs.first(where: { ids.contains($0.id) }) {
+                        JobMenu(job: job, onConvert: { sendToConvert([job]) },
+                                onRemove: { queue.remove(job.id) })
+                    } else {
+                        let ready = convertible(in: ids)
+                        if !ready.isEmpty {
+                            Button("Convert \(ready.count) File\(ready.count == 1 ? "" : "s")") {
+                                sendToConvert(ready)
+                            }
+                        }
+                    }
+                } primaryAction: { ids in
+                    for job in queue.jobs where ids.contains(job.id) { job.openFile() }
+                }
             }
         }
         // The empty states hug their content, and the insets below attach to whatever
@@ -257,6 +285,9 @@ struct DownloadPane: View {
                 Button("Resume All") { queue.resumeAll() }
                 Button("Clear Finished") { queue.clearFinished() }
                     .disabled(!queue.hasFinished)
+                Divider()
+                Button("Convert All Finished") { sendToConvert(queue.convertible.reversed()) }
+                    .disabled(!queue.hasConvertible)
             }
             .menuIndicator(.hidden)   // the stray chevron just adds noise next to the glyph
         }
@@ -304,7 +335,8 @@ struct DownloadPane: View {
     }
 
     private var statusBar: some View {
-        HStack(spacing: 10) {
+        let ready = convertible(in: selection)
+        return HStack(spacing: 10) {
             if let overall = queue.overallProgress, queue.activeCount > 0 {
                 ProgressView(value: overall)
                     .progressViewStyle(.linear)
@@ -315,6 +347,13 @@ struct DownloadPane: View {
                 Text("\(queue.jobs.count) item\(queue.jobs.count == 1 ? "" : "s")")
             }
             Spacer()
+            if !ready.isEmpty {
+                Button("Convert \(ready.count) Selected", systemImage: "wand.and.rays") {
+                    sendToConvert(ready)
+                }
+                .controlSize(.small)
+                .transition(.opacity)
+            }
             Button(action: openDownloadsFolder) {
                 Label(URL(fileURLWithPath: downloadDir).lastPathComponent,
                       systemImage: "folder")
@@ -327,6 +366,7 @@ struct DownloadPane: View {
         .padding(.vertical, 8)
         .background(reduceTransparency ? AnyShapeStyle(.background) : AnyShapeStyle(.bar))
         .animation(settle, value: queue.activeCount)
+        .animation(quick, value: ready.isEmpty)
     }
 
     /// First run on a machine without Homebrew. One button, no terminal.
@@ -455,6 +495,17 @@ struct DownloadPane: View {
         return text
     }
 
+    /// Every route from a download to the Convert pane ends here. Nothing starts
+    /// converting: the files land staged and selected, with the inspector on them.
+    private func sendToConvert(_ jobs: [DownloadJob]) {
+        // Asked again rather than trusted: the button was drawn when the file was there,
+        // and that may have been a while ago.
+        let urls = DownloadQueue.fileURLs(jobs.filter { DownloadQueue.isConvertible($0) })
+        guard !urls.isEmpty else { return }
+        staging.adopt(urls)
+        navigator.pane = .convert
+    }
+
     private func openDownloadsFolder() {
         NSWorkspace.shared.open(URL(fileURLWithPath: downloadDir))
     }
@@ -472,13 +523,28 @@ extension String: @retroactive Identifiable {
 
 // MARK: - Row
 
+private extension DownloadJob {
+    var fileURL: URL? { outputPath.map { URL(fileURLWithPath: $0) } }
+
+    @MainActor func openFile() {
+        guard let url = fileURL, FileManager.default.fileExists(atPath: url.path) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @MainActor func revealInFinder() {
+        guard let url = fileURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+}
+
 struct JobRow: View {
     @Environment(DownloadQueue.self) private var queue
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let job: DownloadJob
+    var onConvert: () -> Void
     @State private var hovering = false
 
-    private var fileURL: URL? { job.outputPath.map { URL(fileURLWithPath: $0) } }
+    private var fileURL: URL? { job.fileURL }
     private var quick: Animation? { reduceMotion ? nil : .smooth(duration: 0.18) }
 
     var body: some View {
@@ -505,8 +571,6 @@ struct JobRow: View {
         .padding(.vertical, 7)
         .contentShape(.rect)
         .onHover { hovering = $0 }
-        .onTapGesture(count: 2) { openFile() }
-        .contextMenu { menu }
     }
 
     private var thumbnail: some View {
@@ -607,7 +671,10 @@ struct JobRow: View {
             case .failed:
                 Button("Retry", systemImage: "arrow.clockwise") { queue.retry(job.id) }
             case .done:
-                Button("Show in Finder", systemImage: "folder") { revealInFinder() }
+                Button("Convert", systemImage: "wand.and.rays", action: onConvert)
+                    .disabled(!DownloadQueue.isConvertible(job))
+                    .help("Send to the Convert pane")
+                Button("Show in Finder", systemImage: "folder") { job.revealInFinder() }
                     .disabled(fileURL == nil)
             }
             Button("Remove", systemImage: "xmark") { queue.remove(job.id) }
@@ -616,16 +683,26 @@ struct JobRow: View {
         .labelStyle(.iconOnly)
         .adaptiveGlass()
         .controlSize(.small)
-        // Fixed width so a state change never shifts the rest of the row sideways.
-        .frame(width: 62, alignment: .trailing)
+        // Fixed width so a state change never shifts the rest of the row sideways; wide
+        // enough for a finished row's three.
+        .frame(width: 92, alignment: .trailing)
         .animation(quick, value: hovering)
     }
+}
 
-    @ViewBuilder
-    private var menu: some View {
-        Button("Open File") { openFile() }.disabled(fileURL == nil)
-        Button("Show in Finder") { revealInFinder() }.disabled(fileURL == nil)
+/// One download's context menu. The list presents it, not the row — see the list.
+/// Closures rather than the queue from the environment: a menu is hosted apart from the
+/// view that declares it, and a missing @Observable there is a crash, not a blank.
+private struct JobMenu: View {
+    let job: DownloadJob
+    var onConvert: () -> Void
+    var onRemove: () -> Void
+
+    var body: some View {
+        Button("Open File") { job.openFile() }.disabled(job.fileURL == nil)
+        Button("Show in Finder") { job.revealInFinder() }.disabled(job.fileURL == nil)
         Divider()
+        Button("Convert…", action: onConvert).disabled(!DownloadQueue.isConvertible(job))
         Button("Open Source Page") {
             if let u = URL(string: job.url) { NSWorkspace.shared.open(u) }
         }
@@ -634,17 +711,7 @@ struct JobRow: View {
             Button("Copy Error Details") { copy(details) }
         }
         Divider()
-        Button("Remove", role: .destructive) { queue.remove(job.id) }
-    }
-
-    private func openFile() {
-        guard let url = fileURL, FileManager.default.fileExists(atPath: url.path) else { return }
-        NSWorkspace.shared.open(url)
-    }
-
-    private func revealInFinder() {
-        guard let url = fileURL else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+        Button("Remove", role: .destructive, action: onRemove)
     }
 
     private func copy(_ text: String) {

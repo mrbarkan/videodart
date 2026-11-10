@@ -116,6 +116,41 @@ final class DownloadQueue {
         save()
     }
 
+    // MARK: - Handing off to Convert
+
+    /// Finished downloads the Convert pane can take, newest first. The one definition of
+    /// "convertible", so the row button, the menus and the Convert pane can't disagree.
+    var convertible: [DownloadJob] { Self.convertible(jobs) }
+
+    /// Stops at the first one, where `convertible.isEmpty` would ask the disk about every
+    /// finished job each time a menu is drawn.
+    var hasConvertible: Bool { jobs.contains { Self.isConvertible($0) } }
+
+    /// Done, with a file, that is still there, and that ffmpeg would read. A success
+    /// without a path is the archive saying this video was already downloaded.
+    ///
+    /// `exists` is a parameter so SelfCheck doesn't depend on what is on this Mac's disk.
+    nonisolated static func isConvertible(
+        _ job: DownloadJob,
+        exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> Bool {
+        guard job.state == .done, let path = job.outputPath else { return false }
+        return FFmpeg.isMedia(URL(fileURLWithPath: path)) && exists(path)
+    }
+
+    /// The queue only ever appends, so its order reversed is newest first — without
+    /// trusting `addedAt`, which a playlist's entries all but share.
+    nonisolated static func convertible(
+        _ jobs: [DownloadJob],
+        exists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }
+    ) -> [DownloadJob] {
+        jobs.reversed().filter { isConvertible($0, exists: exists) }
+    }
+
+    nonisolated static func fileURLs(_ jobs: some Sequence<DownloadJob>) -> [URL] {
+        jobs.compactMap(\.outputPath).map { URL(fileURLWithPath: $0) }
+    }
+
     // MARK: - Running
 
     private func launch(_ id: UUID) {

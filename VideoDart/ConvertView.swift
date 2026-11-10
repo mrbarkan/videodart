@@ -62,12 +62,55 @@ enum ByteCount {
 /// never re-ran it when @State here changed, so the editor went stale — sliders snapped
 /// back, and switching the mode left the old mode's controls on screen. Observation
 /// tracks a read wherever it happens, so the editor reading this object redraws with it.
+///
+/// Owned by the app, not by ConvertView: ContentView builds ConvertView only while the
+/// Convert pane is showing, so a list kept there was thrown away on switching to Download
+/// and nothing outside the pane could add to it.
 @MainActor @Observable
 final class Staging {
     var files: [StagedFile] = []
     var selection: Set<UUID> = []
     /// The preset new outputs get, and what the inspector edits when no output is selected.
     var workingPreset = ConvertPreset.builtIns[0]
+
+    /// A parameter so SelfCheck can adopt paths that don't exist without launching ffmpeg
+    /// at each of them.
+    @ObservationIgnored private let probe: @Sendable (URL) async -> FFmpeg.MediaProbe
+
+    init(probe: @escaping @Sendable (URL) async -> FFmpeg.MediaProbe = FFmpeg.inspect) {
+        self.probe = probe
+    }
+
+    /// Adds files not already staged, probes them, selects their outputs.
+    /// Returns the ids of the outputs now selected (new and already-staged alike).
+    ///
+    /// Not animated: callers that are on screen wrap it in their own withAnimation, which
+    /// is where the Reduce Motion setting is known.
+    @discardableResult
+    func adopt(_ urls: [URL]) -> [UUID] {
+        var adopted: [UUID] = []
+        var seen: Set<URL> = []
+        for url in urls.map(\.standardizedFileURL) where seen.insert(url).inserted {
+            // Sending the same download twice means "show me that one", not a second copy.
+            if let staged = files.first(where: { $0.url.standardizedFileURL == url }) {
+                adopted += staged.outputs.map(\.id)
+                continue
+            }
+            let file = StagedFile(url: url, outputs: [StagedOutput(preset: workingPreset)])
+            files.append(file)
+            adopted += file.outputs.map(\.id)
+            // Duration and dimensions decide every size estimate, so read them right away
+            // rather than making the user press Convert to find out what they added.
+            Task {
+                let result = await probe(url)
+                if let i = files.firstIndex(where: { $0.id == file.id }) { files[i].probe = result }
+            }
+        }
+        // Nothing adopted leaves the selection alone: an empty drop is not a deselect.
+        guard !adopted.isEmpty else { return [] }
+        selection = Set(adopted)
+        return adopted
+    }
 
     private var selectedOutputs: [(file: StagedFile, output: StagedOutput)] {
         files.flatMap { file in file.outputs.map { (file, $0) } }
@@ -123,10 +166,10 @@ final class Staging {
 struct ConvertView: View {
     @Environment(ConvertQueue.self) private var queue
     @Environment(PresetStore.self) private var presets
+    @Environment(Staging.self) private var staging
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    @State private var staging = Staging()
     private var staged: [StagedFile] {
         get { staging.files } nonmutating set { staging.files = newValue }
     }
@@ -259,17 +302,22 @@ struct ConvertView: View {
             pickedPresetID = id
         }
         .task {
-            if let saved = UUID(uuidString: rememberedPreset),
-               let picked = presets.all.first(where: { $0.id == saved }) {
-                pickedPresetID = picked.id
-                workingPreset = picked
+            // The picker is this view's and starts over each time the pane is shown; the
+            // staging list is not. So it is pointed at what is already there, and flagged
+            // as moved by the app — taken as a pick, it would stamp the remembered preset
+            // over every output that arrived selected from the Download pane.
+            if let shown = staging.selectedPresetID ?? UUID(uuidString: rememberedPreset),
+               shown != pickedPresetID, presets.all.contains(where: { $0.id == shown }) {
+                pickerMovedByApp = true
+                pickedPresetID = shown
             }
             #if DEBUG
             // Same convention as VD_OPEN_SHEET on the download side: the staging list is
-            // otherwise only reachable by dropping files, which a test cannot do. Runs
-            // after the preset is restored, so staged rows get the one a drop would get.
+            // otherwise only reachable by dropping files, which a test cannot do. The app
+            // restored the preset before any view existed, so staged rows get the one a
+            // drop would get.
             if let paths = ProcessInfo.processInfo.environment["VD_STAGE"], !paths.isEmpty {
-                _ = adopt(paths.split(separator: "\n").map { URL(fileURLWithPath: String($0)) })
+                adopt(paths.split(separator: "\n").map { URL(fileURLWithPath: String($0)) })
                 // And VD_AUTOCONVERT presses Convert once the probes are in, which a test
                 // can't do either.
                 if ProcessInfo.processInfo.environment["VD_AUTOCONVERT"] != nil {
@@ -342,8 +390,7 @@ struct ConvertView: View {
             .menuIndicator(.hidden)
         }
         ToolbarItem {
-            Button("Add Files…", systemImage: "plus") { chooseFiles() }
-                .help("Choose files to convert")
+            AddFilesMenu(choose: chooseFiles, adopt: adopt)
         }
         ToolbarItem {
             Button("Settings", systemImage: "sidebar.trailing") {
@@ -355,6 +402,7 @@ struct ConvertView: View {
 
     @ViewBuilder
     private var content: some View {
+        @Bindable var staging = staging
         if staged.isEmpty, queue.jobs.isEmpty {
             ContentUnavailableView {
                 Label("Drop Files to Convert", systemImage: "arrow.down.doc")
@@ -363,6 +411,7 @@ struct ConvertView: View {
             } actions: {
                 Button("Add Files…") { chooseFiles() }
                     .adaptiveGlass(prominent: true)
+                AddFinishedDownloadsButton(adopt: adopt)
             }
             // It hugs its content otherwise, and the footer below rides up mid-window.
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -530,29 +579,17 @@ struct ConvertView: View {
     }
 
     private func job(for file: StagedFile, _ output: StagedOutput) -> ConvertJob {
-        var job = ConvertJob(source: file.url, preset: output.preset,
-                             sourceDuration: file.probe?.duration, sourceBytes: file.probe?.bytes,
-                             destinationDir: convertDir.isEmpty ? nil : convertDir)
-        job.trimStart = output.trimStart
-        job.trimEnd = output.trimEnd
-        return job
+        ConvertJob(source: file.url, preset: output.preset, probe: file.probe, destination: convertDir,
+                   trimStart: output.trimStart, trimEnd: output.trimEnd)
     }
 
     // MARK: - Actions
 
+    /// The animated way in for everything on this pane. Whether anything was taken is
+    /// what a drop has to answer.
+    @discardableResult
     private func adopt(_ urls: [URL]) -> Bool {
-        guard !urls.isEmpty else { return false }
-        let fresh = urls.map { StagedFile(url: $0, outputs: [StagedOutput(preset: workingPreset)]) }
-        withAnimation(settle) { staged += fresh }
-        // Duration and dimensions decide every size estimate, so read them right away
-        // rather than making the user press Convert to find out what they dropped.
-        for file in fresh {
-            Task {
-                let probe = await FFmpeg.inspect(file.url)
-                if let i = staged.firstIndex(where: { $0.id == file.id }) { staged[i].probe = probe }
-            }
-        }
-        return true
+        withAnimation(settle) { !staging.adopt(urls).isEmpty }
     }
 
     private func addOutput(to fileID: UUID) {
@@ -619,7 +656,7 @@ struct ConvertView: View {
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.audiovisualContent, .movie, .video, .audio]
         guard panel.runModal() == .OK else { return }
-        _ = adopt(panel.urls)
+        adopt(panel.urls)
     }
 
     private func chooseDestination() {
@@ -641,6 +678,56 @@ struct ConvertView: View {
         fresh.name = newPresetName.trimmingCharacters(in: .whitespaces)
         presets.save(fresh)
         pickedPresetID = fresh.id
+    }
+}
+
+// MARK: - Finished downloads
+
+// Both are views of their own so that only they read the download queue. Read from
+// ConvertView's body, every progress tick of a running download would redraw the whole
+// pane, inspector and all.
+
+/// The toolbar's way in: the file panel, or a download that just finished.
+private struct AddFilesMenu: View {
+    @Environment(DownloadQueue.self) private var downloads
+    var choose: () -> Void
+    var adopt: ([URL]) -> Bool
+
+    var body: some View {
+        let finished = downloads.convertible
+        Menu("Add Files…", systemImage: "plus") {
+            Button("Choose Files…", action: choose)
+            if !finished.isEmpty {
+                Section("Finished Downloads") {
+                    ForEach(finished.prefix(10)) { job in
+                        Button(job.title) { _ = adopt(DownloadQueue.fileURLs([job])) }
+                    }
+                    if finished.count > 1 {
+                        // Every one, not only the ten that fit above — and in the order
+                        // the Download pane lists them, which is oldest first.
+                        Button("All Finished Downloads") {
+                            _ = adopt(DownloadQueue.fileURLs(finished.reversed()))
+                        }
+                    }
+                }
+            }
+        }
+        .menuIndicator(.hidden)
+        .help("Choose files to convert, or add finished downloads")
+    }
+}
+
+private struct AddFinishedDownloadsButton: View {
+    @Environment(DownloadQueue.self) private var downloads
+    var adopt: ([URL]) -> Bool
+
+    var body: some View {
+        let finished = downloads.convertible
+        if !finished.isEmpty {
+            Button("Add Finished Downloads") {
+                _ = adopt(DownloadQueue.fileURLs(finished.reversed()))
+            }
+        }
     }
 }
 

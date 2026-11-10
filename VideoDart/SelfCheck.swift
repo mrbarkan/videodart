@@ -219,6 +219,7 @@ enum SelfCheck {
         assert(YTDLP.formulaVersion(Data(release.utf8)) == nil, "the wrong feed must not parse as the right one")
 
         convert()
+        agents()
     }
 
     /// True when `flags` appears as consecutive arguments — `contains` alone would pass
@@ -773,6 +774,343 @@ enum SelfCheck {
         assert(oldVP9[0].extraFlags == "-row-mt 1", "got \(oldVP9[0].extraFlags)")
         assert(oldVP9[1].extraFlags == "-b:v 0", "only the VP9 legacy flag is removed")
         assert(PresetStore.decode(Data("not json".utf8)).lost)
+
+        // MARK: Sending downloads to Convert
+        func finished(_ title: String, _ path: String?, _ state: JobState = .done) -> DownloadJob {
+            var job = DownloadJob(url: "https://example.com/\(title)", title: title, kind: .videoAudio,
+                                  container: "mp4", destination: "/tmp")
+            job.state = state
+            job.outputPath = path
+            return job
+        }
+        let sendable = [
+            finished("old", "/v/old.mp4"),
+            finished("archived", nil),                       // done, but the archive skipped it
+            finished("deleted", "/v/deleted.mp4"),
+            finished("notes", "/v/notes.txt"),               // on disk, and not media
+            finished("failed", "/v/failed.mp4", .failed),
+            finished("partial", "/v/partial.mp4", .paused),  // a path arrives before the end
+            finished("song", "/v/song.mp3"),
+        ]
+        let onDisk: Set<String> = ["/v/old.mp4", "/v/notes.txt", "/v/failed.mp4", "/v/partial.mp4", "/v/song.mp3"]
+        let ready = DownloadQueue.convertible(sendable, exists: onDisk.contains)
+        assert(ready.map(\.title) == ["song", "old"],
+               "done, with a media file still on disk, newest first; got \(ready.map(\.title))")
+        assert(DownloadQueue.convertible(sendable, exists: { _ in false }).isEmpty,
+               "nothing is convertible once its file is gone")
+        assert(DownloadQueue.fileURLs(ready).map(\.path) == ["/v/song.mp3", "/v/old.mp4"])
+
+        MainActor.assumeIsolated {
+            // No ffmpeg here: the probe is replaced, since none of these paths exist.
+            let staging = Staging(probe: { _ in FFmpeg.MediaProbe() })
+            staging.workingPreset = ConvertPreset.builtIns[1]
+            let a = URL(fileURLWithPath: "/v/a.mp4"), b = URL(fileURLWithPath: "/v/b.mp4")
+            let first = staging.adopt([a, b, a])
+            assert(staging.files.map(\.url.path) == ["/v/a.mp4", "/v/b.mp4"],
+                   "a file named twice in one call is staged once")
+            assert(first.count == 2 && staging.selection == Set(first), "what arrived is what is selected")
+            assert(staging.files.allSatisfy { $0.outputs.count == 1 && $0.outputs[0].preset == ConvertPreset.builtIns[1] },
+                   "new files get one output with the working preset, as a drop does")
+
+            // The same file again, spelled differently, with one new one.
+            let c = URL(fileURLWithPath: "/v/c.mp4")
+            let again = staging.adopt([URL(fileURLWithPath: "/v/x/../a.mp4"), c])
+            assert(staging.files.count == 3, "an already staged file is not added twice")
+            assert(again == [first[0], staging.files[2].outputs[0].id],
+                   "its existing output is returned, alongside the new one")
+            assert(staging.selection == Set(again), "and selection moves to exactly those")
+
+            assert(staging.adopt([]).isEmpty && staging.selection == Set(again),
+                   "adopting nothing must not clear the selection")
+        }
+    }
+
+    /// The agents' side: the protocol and every tool's argument handling, with no socket,
+    /// queue or network behind any of it.
+    private static func agents() {
+        // MARK: Lines off a socket
+        var buffer = LineBuffer()
+        assert(buffer.append(Data("{\"a\":".utf8)).isEmpty, "half a message is not a message yet")
+        assert(buffer.append(Data("1}\n{\"b\":2}\r\n\n{\"c\"".utf8)) == ["{\"a\":1}", "{\"b\":2}"],
+               "one read can finish a line, hold a whole one, and start a third")
+        assert(buffer.append(Data(":3}\n".utf8)) == ["{\"c\":3}"])
+
+        // MARK: JSON-RPC
+        func reply(_ line: String) -> JSON? {
+            if case let .reply(message) = MCP.route(line, appVersion: "9.9.9") { message } else { nil }
+        }
+        assert(reply("not json")?["error"]?["code"] == -32700, "unparseable is a parse error")
+        assert(reply("not json")?["id"] == .null)
+        assert(reply("[1,2]")?["error"]?["code"] == -32600, "JSON, but not a request")
+        assert(reply(#"{"jsonrpc":"2.0","id":4}"#)?["error"]?["code"] == -32600, "a request needs a method")
+        assert(MCP.route(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#, appVersion: "") == .silent,
+               "no id is a notification, and is never answered")
+        assert(MCP.route(#"{"jsonrpc":"2.0","method":"no/such/thing"}"#, appVersion: "") == .silent,
+               "not even when the method is unknown")
+        assert(MCP.route(#"{"jsonrpc":"2.0","id":1,"result":{}}"#, appVersion: "") == .silent,
+               "a response to nothing this server asked is ignored")
+        let unknown = reply(#"{"jsonrpc":"2.0","id":"abc","method":"resources/list"}"#)
+        assert(unknown?["error"]?["code"] == -32601 && unknown?["id"] == "abc", "unknown method, id echoed")
+        assert(reply(#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#)?.line == #"{"id":7,"jsonrpc":"2.0","result":{}}"#,
+               "a numeric id comes back as 7, not 7.0 and not true")
+        assert(reply(#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)?["id"] == 1, "an id of 1 is not a boolean")
+
+        // MARK: initialize
+        func negotiated(_ params: String) -> JSON? {
+            reply(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":\#(params)}"#)?["result"]
+        }
+        assert(negotiated(#"{"protocolVersion":"2024-11-05"}"#)?["protocolVersion"] == "2024-11-05",
+               "a version this server speaks is the one it answers in")
+        assert(negotiated(#"{"protocolVersion":"2025-03-26"}"#)?["protocolVersion"] == "2025-03-26")
+        assert(negotiated(#"{"protocolVersion":"2099-01-01"}"#)?["protocolVersion"] == "2025-06-18",
+               "one it doesn't gets the newest it has")
+        assert(negotiated("{}")?["protocolVersion"] == "2025-06-18")
+        let hello = negotiated(#"{"protocolVersion":"2025-06-18"}"#)
+        assert(hello?["serverInfo"] == ["name": "videodart", "version": "9.9.9"])
+        assert(hello?["capabilities"] == ["tools": [:]], "tools, and nothing else is promised")
+        assert(hello?["instructions"]?.stringValue?.contains("wait_for_jobs") == true)
+
+        // MARK: tools/list
+        let listed = reply(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)?["result"]?["tools"]?.arrayValue ?? []
+        assert(listed.compactMap { $0["name"]?.stringValue } == [
+            "get_status", "probe_url", "add_download", "list_downloads", "control_downloads", "list_presets",
+            "convert", "stage_for_convert", "list_conversions", "control_conversions", "wait_for_jobs",
+        ], "every tool, once")
+        for tool in listed {
+            let name = tool["name"]?.stringValue ?? "?"
+            let schema = tool["inputSchema"]
+            assert(tool["description"]?.stringValue?.isEmpty == false, "\(name) says what it does")
+            assert(schema?["type"] == "object", "\(name): an input schema is always an object")
+            let properties = schema?["properties"]?.objectValue ?? [:]
+            assert(properties.values.allSatisfy { $0["type"]?.stringValue != nil && $0["description"] != nil },
+                   "\(name): every argument has a type and a description")
+            let required = schema?["required"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            assert(required.allSatisfy { properties[$0] != nil }, "\(name) requires an argument it doesn't declare")
+        }
+
+        // MARK: tools/call routing
+        assert(reply(#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"delete_everything"}}"#)?["error"]?["code"] == -32602,
+               "an unknown tool is the caller's mistake, said as one")
+        assert(reply(#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"convert","arguments":[1]}}"#)?["error"]?["code"] == -32602)
+        assert(MCP.route(#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_status"}}"#, appVersion: "")
+               == .call(id: 3, name: "get_status", arguments: [:]), "arguments may be left out")
+        assert(MCP.route(#"{"jsonrpc":"2.0","id":"x","method":"tools/call","params":{"name":"list_downloads","arguments":{"state":"done"}}}"#, appVersion: "")
+               == .call(id: "x", name: "list_downloads", arguments: ["state": "done"]))
+        let ok = MCP.success(["n": 1])
+        assert(ok["structuredContent"] == ["n": 1] && ok["content"]?.arrayValue?.first?["text"] == #"{"n":1}"#,
+               "the text block and the structured one say the same thing")
+        assert(ok["isError"] == nil && MCP.failure("no")["isError"] == true)
+
+        // MARK: add_download
+        func request(_ arguments: [String: JSON]) -> Result<MCP.DownloadRequest, MCP.ToolError> {
+            Result { try MCP.downloadRequest(arguments) }.mapError { $0 as! MCP.ToolError }
+        }
+        func refused<T>(_ result: Result<T, MCP.ToolError>, _ word: String) -> Bool {
+            if case let .failure(error) = result { error.message.contains(word) } else { false }
+        }
+        let link: JSON = "https://example.com/watch?v=1"
+        let plain = try! request(["url": link]).get()
+        assert(plain.kind == .videoAudio && plain.quality == "best" && plain.container == "mp4" && plain.subs == .off,
+               "the Add sheet's defaults")
+        assert(plain.subLangs == nil && plain.destination == nil && plain.playlistItems == nil,
+               "left out means the user's own setting, decided when the job is built")
+        let video = try! request(["url": link, "kind": "video", "quality": 1080, "container": "mkv",
+                                  "subtitles": "embed", "subtitle_languages": ["en", "es"]]).get()
+        assert(video.kind == .video && video.quality == "1080" && video.container == "mkv")
+        assert(video.subs == .embed && video.subLangs == "en,es")
+        assert(try! request(["url": link, "quality": "720p"]).get().quality == "720", "the menu's own spelling")
+        let audio = try! request(["url": link, "kind": "audio", "quality": "1080", "subtitles": "embed"]).get()
+        assert(audio.kind == .audio && audio.container == "m4a", "audio has its own default container")
+        assert(audio.subs == .off && audio.quality == "best", "and no use for subtitles or a height")
+        assert(try! request(["url": link, "kind": "audio", "container": "FLAC"]).get().container == "flac")
+        assert(refused(request(["url": link, "kind": "audio", "container": "mp4"]), "m4a"),
+               "a video container on an audio job names the ones that would work")
+        assert(refused(request(["url": link, "kind": "both"]), "video_audio"), "a bad kind lists the good ones")
+        assert(refused(request(["url": link, "quality": "huge"]), "quality"))
+        assert(refused(request(["url": link, "subtitles": "burned"]), "subtitles"))
+        assert(refused(request(["url": link, "destination": "Movies"]), "absolute"))
+        assert(try! request(["url": link, "destination": "~/Movies"]).get().destination == NSHomeDirectory() + "/Movies")
+        assert(refused(request([:]), "url") && refused(request(["url": 5]), "url"))
+        assert(refused(request(["url": "--exec=rm -rf ~"]), "http") && refused(request(["url": "-U"]), "http"),
+               "a link is a yt-dlp argument; one that reads as an option must never get there")
+        assert(refused(request(["url": "ytsearch:cats"]), "http"))
+        assert(try! request(["url": link, "playlist_items": [3, 1, 3]]).get().playlistItems == [3, 1],
+               "the order asked for, each entry once")
+        assert(refused(request(["url": link, "playlist_items": [0]]), "playlist_items"), "indexes start at 1")
+        assert(refused(request(["url": link, "playlist_items": [1.5]]), "playlist_items"))
+        assert(refused(request(["url": link, "playlist_items": []]), "playlist_items"))
+
+        let playlist = MediaInfo(isPlaylist: true, title: "Mix", entries: (1...3).map {
+            MediaInfo.Entry(id: "v\($0)", url: "https://example.com/v\($0)", title: "Video \($0)",
+                            duration: 60, thumbnail: nil, uploader: "Someone")
+        })
+        func jobs(_ arguments: [String: JSON]) -> Result<[DownloadJob], MCP.ToolError> {
+            Result {
+                try MCP.downloadJobs(try MCP.downloadRequest(arguments), info: playlist,
+                                     defaultDestination: "/Users/x/Downloads", defaultSubLangs: "pt")
+            }.mapError { $0 as! MCP.ToolError }
+        }
+        let whole = try! jobs(["url": link]).get()
+        assert(whole.map(\.url) == playlist.entries.map(\.url), "one job per entry, the entry's own link")
+        assert(whole.allSatisfy { $0.destination == "/Users/x/Downloads" && $0.subLangs == "pt" && $0.state == .queued },
+               "the user's folder and languages where none were given")
+        assert(whole[0].title == "Video 1" && whole[0].uploader == "Someone" && whole[0].duration == 60)
+        let some = try! jobs(["url": link, "playlist_items": [3, 1], "kind": "audio", "container": "mp3",
+                              "destination": "/Volumes/Clips", "subtitle_languages": "all"]).get()
+        assert(some.map(\.title) == ["Video 3", "Video 1"] && some.allSatisfy { $0.kind == .audio && $0.container == "mp3" })
+        assert(some.allSatisfy { $0.destination == "/Volumes/Clips" && $0.subLangs == "all" })
+        assert(refused(jobs(["url": link, "playlist_items": [2, 4]]), "entry 4"), "an index past the end is named")
+        assert(MCP.describe(playlist)["entries"]?.arrayValue?.map { $0["index"] } == [1, 2, 3], "indexes are 1-based")
+
+        // MARK: Jobs as agents see them
+        var shown = DownloadJob(url: "https://example.com/a", title: "A", kind: .videoAudio, container: "mp4",
+                                destination: "/tmp")
+        shown.state = .done
+        shown.progress = 1
+        shown.outputPath = "/v/a.mp4"
+        let described = MCP.describe(shown)
+        assert(described["kind"] == "video_audio" && described["state"] == "done" && described["progress"] == 1)
+        assert(described["output_path"] == "/v/a.mp4" && described["error"] == .null && described["url"] == "https://example.com/a")
+        assert(described["id"]?.stringValue == shown.id.uuidString)
+        for key in ["speed", "eta", "size", "title", "type"] { assert(described[key] != nil, "missing \(key)") }
+
+        // MARK: control_downloads
+        func download(_ state: JobState) -> DownloadJob {
+            var job = DownloadJob(url: "https://example.com/\(state.rawValue)", title: state.rawValue,
+                                  kind: .videoAudio, container: "mp4", destination: "/tmp")
+            job.state = state
+            return job
+        }
+        let fleet: [DownloadJob] = [.queued, .downloading, .processing, .paused, .done, .failed].map(download)
+        func hit(_ action: String, _ ids: [UUID]? = nil) -> Result<[String], MCP.ToolError> {
+            Result { try MCP.downloadTargets(action: action, ids: ids, jobs: fleet) }
+                .map { ids in fleet.filter { ids.contains($0.id) }.map(\.title) }
+                .mapError { $0 as! MCP.ToolError }
+        }
+        assert(try! hit("pause").get() == ["queued", "downloading", "processing"])
+        assert(try! hit("resume").get() == ["paused", "failed"], "as Resume All")
+        assert(try! hit("retry").get() == ["failed"])
+        assert(try! hit("clear_finished").get() == ["done", "failed"])
+        assert(try! hit("pause", [fleet[1].id, fleet[4].id]).get() == ["downloading"],
+               "pausing a finished job is nothing to do, not an error")
+        assert(try! hit("remove", [fleet[0].id, fleet[4].id]).get() == ["queued", "done"])
+        assert(refused(hit("remove"), "ids"), "remove never means everything")
+        assert(refused(hit("delete"), "pause"), "an unknown action lists the real ones")
+        assert(refused(hit("pause", [UUID()]), "No job"), "an id that isn't in the queue is said, not skipped")
+
+        // MARK: Presets by name and by id
+        var mine = ConvertPreset(name: "h.264 mp4")
+        mine.crf = 30
+        let shelf = ConvertPreset.builtIns + [mine]
+        assert(MCP.preset("H.264 MP4", in: shelf)?.isBuiltIn == true, "an exact name wins over a near one")
+        assert(MCP.preset("h.264 mp4", in: shelf)?.id == mine.id)
+        assert(MCP.preset("fit to 25 mb", in: shelf)?.name == "Fit to 25 MB", "case is forgiven when nothing matches exactly")
+        assert(MCP.preset(mine.id.uuidString, in: shelf)?.crf == 30, "by id")
+        assert(MCP.preset(ConvertPreset.stableID("WebM VP9").uuidString.lowercased(), in: shelf)?.name == "WebM VP9")
+        assert(MCP.preset("H.266", in: shelf) == nil)
+        assert(MCP.describe(mine)["built_in"] == false && MCP.describe(shelf[0])["summary"]?.stringValue?.contains("MP4") == true)
+
+        // MARK: convert — all or nothing
+        var finishedClip = download(.done), pausedClip = download(.paused), archived = download(.done)
+        finishedClip.outputPath = "/v/clip.mkv"
+        pausedClip.outputPath = "/v/partial.mp4"
+        archived.title = "seen before"
+        let downloads = [finishedClip, pausedClip, archived]
+        let disk: Set<String> = ["/v/a.mov", "/v/b.mp4", "/v/notes.txt", "/v/clip.mkv", "/v/partial.mp4"]
+        let remembered = ConvertPreset.stableID("Fit to 25 MB").uuidString
+        func plan(_ arguments: [String: JSON]) -> Result<MCP.ConvertPlan, MCP.ToolError> {
+            Result {
+                try MCP.convertPlan(arguments, presets: shelf, remembered: remembered,
+                                    defaultDestination: "", downloads: downloads, exists: disk.contains)
+            }.mapError { $0 as! MCP.ToolError }
+        }
+        let simple = try! plan(["paths": ["/v/a.mov", "/v/x/../a.mov", "/v/b.mp4"],
+                                "download_ids": [.string(finishedClip.id.uuidString)]]).get()
+        assert(simple.sources.map(\.path) == ["/v/a.mov", "/v/b.mp4", "/v/clip.mkv"],
+               "paths then downloads, the same file once however it was spelled")
+        assert(simple.preset.name == "Fit to 25 MB", "no preset named means the one the user last chose")
+        assert(simple.destination.isEmpty && simple.trimStart.isEmpty && simple.trimEnd.isEmpty,
+               "the pane's folder setting, and no trim")
+        let cut = try! plan(["paths": "/v/a.mov", "preset": "Audio: MP3 320", "trim_start": 5,
+                             "trim_end": "1:30", "destination": "/Volumes/Out/"]).get()
+        assert(cut.preset.container == "mp3" && cut.trimStart == "5" && cut.trimEnd == "1:30")
+        assert(cut.destination == "/Volumes/Out")
+        let asJob = ConvertJob(source: cut.sources[0], preset: cut.preset,
+                               probe: FFmpeg.MediaProbe(duration: 100, bytes: 5_000_000),
+                               destination: cut.destination, trimStart: cut.trimStart, trimEnd: cut.trimEnd)
+        assert(asJob.sourceDuration == 100 && asJob.sourceBytes == 5_000_000, "the probe reaches the job")
+        assert(asJob.destinationDir == "/Volumes/Out" && FFmpeg.effectiveDuration(asJob) == 85)
+        assert(ConvertJob(source: cut.sources[0], preset: cut.preset, probe: nil, destination: "").destinationDir == nil,
+               "an empty folder setting is beside the source")
+        assert(try! plan(["paths": ["/v/a.mov"], "preset": .string(mine.id.uuidString)]).get().preset.crf == 30)
+        // One bad item among good ones refuses the lot, and says which.
+        assert(refused(plan(["paths": ["/v/a.mov", "/v/gone.mp4"]]), "/v/gone.mp4"), "a missing file")
+        assert(refused(plan(["paths": ["/v/a.mov", "/v/notes.txt"]]), "/v/notes.txt"), "a file that isn't media")
+        assert(refused(plan(["paths": ["/v/a.mov", "b.mp4"]]), "absolute"))
+        assert(refused(plan(["paths": ["/v/a.mov"], "preset": "H.266"]), "H.266"), "an unknown preset")
+        assert(refused(plan(["paths": ["/v/a.mov"], "download_ids": [.string(pausedClip.id.uuidString)]]), "paused"),
+               "an unfinished download, by its state")
+        assert(refused(plan(["download_ids": [.string(archived.id.uuidString)]]), "seen before"),
+               "a download the archive skipped has no file to convert")
+        assert(refused(plan(["download_ids": [.string(UUID().uuidString)]]), "No download"))
+        assert(refused(plan(["download_ids": ["seven"]]), "seven"))
+        assert(refused(plan(["paths": ["/v/a.mov"], "trim_start": "1:70"]), "1:70"), "a bad timecode")
+        assert(refused(plan(["paths": ["/v/a.mov"], "trim_start": "2:00", "trim_end": 90]), "later"),
+               "an end before the start")
+        assert(refused(plan(["paths": ["/v/a.mov"], "destination": "Out"]), "absolute"))
+        assert(refused(plan([:]), "at least one") && refused(plan(["paths": []]), "at least one"))
+        assert(try! plan(["paths": ["/v/a.mov"]]).get().preset == (try! plan(["paths": ["/v/a.mov"], "preset": "Fit to 25 MB"]).get().preset))
+        let forgotten = try! MCP.convertPlan(["paths": ["/v/a.mov"]], presets: shelf, remembered: "",
+                                             defaultDestination: "/Volumes/Converted", downloads: [], exists: disk.contains)
+        assert(forgotten.preset.id == ConvertPreset.builtIns[0].id && forgotten.destination == "/Volumes/Converted",
+               "nothing remembered falls back to the first preset, as the pane does")
+
+        // MARK: control_conversions and waiting
+        func conversion(_ state: ConvertState) -> ConvertJob {
+            var job = ConvertJob(source: URL(fileURLWithPath: "/v/\(state.rawValue).mov"), preset: shelf[0])
+            job.state = state
+            return job
+        }
+        let line: [ConvertJob] = [.queued, .converting, .done, .failed, .cancelled].map(conversion)
+        func touched(_ action: String, _ ids: [UUID]? = nil) -> [String] {
+            let ids = (try? MCP.conversionTargets(action: action, ids: ids, jobs: line)) ?? []
+            return line.filter { ids.contains($0.id) }.map(\.state.rawValue)
+        }
+        assert(touched("cancel") == ["queued", "converting"])
+        assert(touched("retry") == ["failed", "cancelled"], "a bare retry doesn't redo what worked")
+        assert(touched("retry", [line[2].id]) == ["done"], "but a finished job asked for by id runs again")
+        assert(touched("clear_finished") == ["done", "failed", "cancelled"])
+        assert((try? MCP.conversionTargets(action: "remove", ids: nil, jobs: line)) == nil)
+        assert((try? MCP.conversionTargets(action: "pause", ids: nil, jobs: line)) == nil, "conversions don't pause")
+        let seen = MCP.describe(line[2])
+        assert(seen["source"] == "/v/done.mov" && seen["preset"] == "H.264 MP4" && seen["type"] == "conversion")
+
+        assert([JobState.done, .failed, .paused].allSatisfy { MCP.isSettled($0) })
+        assert([JobState.queued, .downloading, .processing].allSatisfy { !MCP.isSettled($0) })
+        assert([ConvertState.done, .failed, .cancelled].allSatisfy { MCP.isSettled($0) })
+        assert(!MCP.isSettled(ConvertState.queued) && !MCP.isSettled(ConvertState.converting))
+        assert(try! MCP.timeout([:]) == 30 && MCP.timeout(["timeout_seconds": 600]) == 120
+               && MCP.timeout(["timeout_seconds": -5]) == 0, "thirty by default, never more than two minutes")
+        assert((try? MCP.timeout(["timeout_seconds": "soon"])) == nil)
+        let states = try! MCP.filter(fleet, ["state": "paused"], states: MCP.downloadStates) { $0.state.rawValue }
+        assert(states.map(\.title) == ["paused"])
+        assert((try? MCP.filter(fleet, ["state": "cancelled"], states: MCP.downloadStates) { $0.state.rawValue }) == nil,
+               "a state the queue doesn't have is refused, not answered with an empty list")
+        assert(try! MCP.filter(fleet, ["ids": [.string(fleet[5].id.uuidString)]], states: MCP.downloadStates) { $0.state.rawValue }
+            .map(\.title) == ["failed"])
+
+        // MARK: What Settings copies
+        assert(MCP.claudeCommand(executable: "/Applications/VideoDart.app/Contents/MacOS/VideoDart")
+               == "claude mcp add videodart -- /Applications/VideoDart.app/Contents/MacOS/VideoDart --mcp")
+        assert(MCP.claudeCommand(executable: "/Users/a b/It's/VideoDart")
+               == #"claude mcp add videodart -- '/Users/a b/It'\''s/VideoDart' --mcp"#, "a path with a space is one word")
+        let config = JSON(parsing: MCP.clientConfig(executable: "/Apps/My Copy/VideoDart"))
+        assert(config?["mcpServers"]?["videodart"] == ["command": "/Apps/My Copy/VideoDart", "args": ["--mcp"]])
+
+        // MARK: The socket path
+        assert(MCPSocket.address("/tmp/videodart.sock") != nil)
+        assert(MCPSocket.address("/" + String(repeating: "x", count: 102)) != nil, "103 bytes fit")
+        assert(MCPSocket.address("/" + String(repeating: "x", count: 103)) == nil, "104 leave no room for the terminator")
     }
 }
 #endif

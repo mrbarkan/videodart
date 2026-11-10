@@ -16,6 +16,8 @@ struct SettingsView: View {
     @AppStorage(Prefs.Key.useArchive) private var useArchive = false
     @AppStorage(Prefs.Key.watchClipboard) private var watchClipboard = true
     @AppStorage(Prefs.Key.betaUpdates) private var betaUpdates = false
+    @AppStorage(Prefs.Key.mcpEnabled) private var mcpEnabled = true
+    @Environment(MCPServer.self) private var agentServer
 
     @State private var version = "…"
     // The first text field took focus on open, so Filename sat selected and one stray
@@ -30,6 +32,7 @@ struct SettingsView: View {
             general.tabItem { Label("General", systemImage: "gearshape") }
             account.tabItem { Label("Account", systemImage: "person.badge.key") }
             advanced.tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
+            agents.tabItem { Label("Agents", systemImage: "sparkles") }
         }
         .frame(width: 520, height: 400)
         .task {
@@ -219,6 +222,57 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var agents: some View {
+        Form {
+            Section {
+                Toggle("Let agents control VideoDart", isOn: $mcpEnabled)
+                LabeledContent("Status") {
+                    Text(agentStatus.text)
+                        .foregroundStyle(agentStatus.isProblem ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                        .multilineTextAlignment(.trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } footer: {
+                Text("An agent you connect can download, convert and follow progress, in the same queues you see here. It can’t change settings, edit presets or delete files. Only apps running as you on this Mac can connect — nothing listens on the network.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Section {
+                LabeledContent("Claude Code") {
+                    Button("Copy Claude Code Command") { copy(MCP.claudeCommand(executable: Self.executable)) }
+                }
+                LabeledContent("Claude Desktop, Cursor, others") {
+                    Button("Copy MCP Config") { copy(MCP.clientConfig(executable: Self.executable)) }
+                }
+            } footer: {
+                // The path is this copy's: moving the app means copying the line again.
+                Text("Run the command in Terminal, or paste the config into the app’s MCP settings. Both point at this copy of VideoDart, and start it when it isn’t open.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var agentStatus: (text: String, isProblem: Bool) {
+        switch agentServer.status {
+        case .listening: ("Ready for agents", false)
+        case .off: ("Off", false)
+        case let .unavailable(reason): (reason, true)
+        }
+    }
+
+    private static var executable: String {
+        Bundle.main.executableURL?.path ?? "/Applications/VideoDart.app/Contents/MacOS/VideoDart"
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// The command that updates the copy in use; `brew upgrade` was named for every copy.

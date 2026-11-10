@@ -52,6 +52,31 @@ Terminal, nothing to configure.
 - Self-updating via [Sparkle](https://sparkle-project.org) — or **VideoDart →
   Check for Updates…** whenever you like.
 
+## Use with an agent
+
+VideoDart is also an [MCP](https://modelcontextprotocol.io) server, so an agent can
+download and convert for you — "get this video and give me a 25 MB MP4" — in the same
+queues you see in the window.
+
+```sh
+claude mcp add videodart -- /Applications/VideoDart.app/Contents/MacOS/VideoDart --mcp
+```
+
+For Claude Desktop, Cursor and other clients, add it to their MCP config instead:
+
+```json
+{ "mcpServers": { "videodart": {
+    "command": "/Applications/VideoDart.app/Contents/MacOS/VideoDart", "args": ["--mcp"] } } }
+```
+
+**Settings ▸ Agents** copies both with the right path for your copy, and is where to turn
+agent access off. The app is started in the background if it isn't open.
+
+An agent can read a link, queue downloads, convert files or finished downloads with any
+preset, put files in the Convert pane for you to finish, and wait for jobs to end. It
+can't change settings, edit presets or delete files. Nothing listens on the network: the
+connection is a socket file only your own user account can open.
+
 ## Install
 
 Grab the latest signed `.dmg` from the
@@ -102,6 +127,11 @@ Plain SwiftUI with `@Observable` models; no third-party dependencies beyond Spar
   be replaced without invalidating the signature, which would freeze yt-dlp between
   app releases — exactly the staleness the app warns you about.
 - **`ContentView.swift`** / **`ConvertView.swift`** — the two windows.
+- **`MCP.swift`** / **`MCPServer.swift`** / **`MCPBridge.swift`** — the agent connector.
+  `VideoDart --mcp` is a stdio relay (`MCPBridge`) to a Unix socket the running app
+  listens on (`MCPServer`); every tool goes through the same two queues as the UI.
+  `MCP` holds the protocol and argument handling as pure functions, which is what
+  SelfCheck exercises.
 
 State lives in `~/Library/Application Support/VideoDart/`.
 

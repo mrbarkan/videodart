@@ -45,7 +45,15 @@ style, for anything with a branch in it.
 What it covers, and why each one is there rather than being obvious: yt-dlp and FFmpeg
 progress-line parsing (both tools report `N/A` for unknown fields in more than one
 spelling), both argument builders, `cleanError` for each tool, timecode parsing, FFmpeg
-output-path collision handling, and the on-disk shape of `queue.json` / `presets.json`.
+output-path collision handling, the on-disk shape of `queue.json` / `presets.json`, and
+the agent connector: JSON-RPC routing, version negotiation, every tool's schema, and each
+tool's argument mapping and validation. That last part works because `MCP` (in
+`MCP.swift`) is pure functions with no socket, queue or disk behind them — keep new tool
+logic there and have `MCPServer` only carry it out.
+
+To drive the connector by hand, pipe newline-delimited JSON-RPC into
+`VideoDart --mcp` while the Debug app is running. The Debug and installed copies share
+`queue.json` and the socket path; whichever started first holds the socket.
 
 **Decoding is deliberately lenient in both persisted models** (`DownloadJob`,
 `ConvertPreset`): every key falls back to a default when absent. Synthesized decoding
@@ -74,5 +82,21 @@ verbatim older on-disk payload to catch that; keep those cases when you add a fi
   the newest beta tagged `<sparkle:channel>beta</sparkle:channel>`. Copies only see the
   beta when Settings ▸ Advanced ▸ "Get beta versions" is on (off by default). Copies from
   before 0.7.0 know no channels and only ever see the stable entry.
+- **Agents connect over a Unix socket, not a localhost port.** `VideoDart --mcp` is a
+  stdio relay to `mcp.sock` in Application Support (mode 0600). Any web page the user
+  visits can reach an HTTP server on localhost; nothing but the user's own processes can
+  open that file. Don't add a TCP listener "for convenience".
+- **The MCP server lives in the app, and the queues stay single-owner.** The relay knows
+  nothing but where a line ends; every tool runs on the main actor through
+  `DownloadQueue` / `ConvertQueue`. An agent path that ran yt-dlp or ffmpeg itself would
+  be a second writer of `queue.json` — which is how a queue gets wiped — and work the
+  user can't see.
+- **`@main` is `enum Main`, not `VideoDartApp`.** `--mcp` has to branch off before SwiftUI
+  exists: the relay must never start `NSApplication`, Sparkle, `Prefs` or SelfCheck.
+- **An agent's link must be `http(s)://`.** It becomes a bare yt-dlp argument, and one
+  starting with a dash would be read as an option (`--exec` among them).
+- **A second copy never takes a socket somebody answers at.** `MCPServer` test-connects
+  first and only replaces a file nobody is listening on, so a Debug build can't cut off
+  the agents connected to the installed app (or the reverse).
 - **`ARCHS` is passed on the `xcodebuild` command line** in `make-release.sh`. The same
   value in `project.pbxproj` is silently ignored and yields an arm64-only binary.

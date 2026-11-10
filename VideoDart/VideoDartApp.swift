@@ -38,22 +38,58 @@ final class Updater {
     func checkForUpdates() { controller.checkForUpdates(nil) }
 }
 
+/// The executable is two programs. An MCP client runs it with `--mcp` and gets a stdio
+/// relay to the app that is already open; that path has to branch off before SwiftUI
+/// exists, or every agent session would open a window and start a second updater.
 @main
+enum Main {
+    @MainActor static func main() {
+        if CommandLine.arguments.contains("--mcp") { MCPBridge.run() }
+        VideoDartApp.main()
+    }
+}
+
 struct VideoDartApp: App {
-    @State private var queue = DownloadQueue()
+    @State private var queue: DownloadQueue
     // Owned by the app, not by ConvertView: a Window scene tears its view down when the
     // window closes, which would orphan a running ffmpeg and leak its power assertion.
-    @State private var converter = ConvertQueue()
-    @State private var presets = PresetStore()
+    @State private var converter: ConvertQueue
+    @State private var presets: PresetStore
+    // Also the app's: ContentView builds ConvertView only while its pane is showing, and
+    // the Download pane has to be able to stage files while it isn't.
+    @State private var staging: Staging
     @State private var updater = Updater()
-    @State private var navigator = Navigator()
+    @State private var navigator: Navigator
+    @State private var agents: MCPServer
 
     init() {
+        // Built here rather than as defaults, so the agents' server can be handed the
+        // very objects the windows get.
+        let queue = DownloadQueue(), converter = ConvertQueue(), navigator = Navigator()
+        _queue = State(initialValue: queue)
+        _converter = State(initialValue: converter)
+        _navigator = State(initialValue: navigator)
         Prefs.register()
         DownloadQueue.requestNotificationPermission()
+        // The remembered preset is restored here, once, rather than when the Convert pane
+        // appears: a download sent over before that pane was ever opened must get the
+        // preset a drop would, and reopening the pane must not undo edits made since.
+        let presets = PresetStore()
+        let staging = Staging()
+        if let saved = UUID(uuidString: Prefs.string(Prefs.Key.convertPreset)),
+           let picked = presets.all.first(where: { $0.id == saved }) {
+            staging.workingPreset = picked.reconciled()
+        }
+        _presets = State(initialValue: presets)
+        _staging = State(initialValue: staging)
+        let agents = MCPServer(queue: queue, converter: converter, presets: presets,
+                               staging: staging, navigator: navigator)
+        _agents = State(initialValue: agents)
         #if DEBUG
         SelfCheck.run()
         #endif
+        // After the checks: a build that is about to trap has no business taking the socket.
+        agents.followPreference()
     }
 
     var body: some Scene {
@@ -62,6 +98,7 @@ struct VideoDartApp: App {
                 .environment(queue)
                 .environment(converter)
                 .environment(presets)
+                .environment(staging)
                 .environment(navigator)
         }
         .defaultSize(width: 860, height: 580)
@@ -98,6 +135,6 @@ struct VideoDartApp: App {
             }
         }
 
-        Settings { SettingsView() }
+        Settings { SettingsView().environment(agents) }
     }
 }

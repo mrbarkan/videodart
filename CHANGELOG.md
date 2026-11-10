@@ -3,6 +3,26 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
+## Unreleased
+
+### Added
+
+- **Use VideoDart from an agent.** VideoDart is now an MCP server: connect Claude Code,
+  Claude Desktop, Cursor or any other MCP client and ask it to download a link, convert
+  a file with one of your presets, or wait for a job and hand back the result. Everything
+  it does appears in the same queues you see. Settings ▸ Agents has the one-line command
+  to copy and the switch to turn it off. Agents can't change settings, edit presets or
+  delete files, and nothing listens on the network.
+- **Send finished downloads to Convert.** A Convert button on every finished download,
+  "Convert N Selected" for several at once (the download list is now multi-select), and
+  "Convert All Finished" in the More menu. From the Convert pane, the Add button lists
+  your recent finished downloads.
+
+### Fixed
+
+- **Files staged for conversion survive switching panes.** Going back to Download no
+  longer empties the Convert list.
+
 ## 0.7.1, 2026-10-27
 
 ### Fixed

@@ -24,6 +24,9 @@ enum Prefs {
         static let convertDir = "convertDir"
         static let convertPreset = "convertPreset"
         static let betaUpdates = "betaUpdates"
+        /// Whether the app listens for agents on its socket. On by default: the socket is
+        /// reachable only by this user, who could already run yt-dlp without asking.
+        static let mcpEnabled = "mcpEnabled"
     }
 
     static let browsers = ["safari", "chrome", "brave", "firefox", "edge", "chromium", "vivaldi", "opera"]
@@ -47,6 +50,7 @@ enum Prefs {
             Key.convertDir: "",
             Key.convertPreset: "",
             Key.betaUpdates: false,
+            Key.mcpEnabled: true,
         ])
     }
 
