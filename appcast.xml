@@ -3,6 +3,18 @@
   <channel>
     <title>VideoDart</title>
     <item>
+      <title>0.8.0 Beta</title>
+      <pubDate>Tue, 10 Nov 2026 18:12:34 -0300</pubDate>
+      <sparkle:version>202611102110</sparkle:version>
+      <sparkle:shortVersionString>0.8.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <sparkle:channel>beta</sparkle:channel>
+      <enclosure
+        url="https://github.com/mrbarkan/videodart/releases/download/v0.8.0-beta.1/VideoDart.dmg"
+        type="application/octet-stream"
+        sparkle:edSignature="tzDYAyExT7srzk3Xbgp/y09pPOia2lFtOFHNA/BRTLr6H/Sm3eln3W1x/NEDt9ge68wUU8hWQAsobHU6dlPhDg==" length="3644343" />
+    </item>
+    <item>
       <title>0.7.1</title>
       <pubDate>Tue, 27 Oct 2026 20:27:52 -0300</pubDate>
       <sparkle:version>202610272326</sparkle:version>
