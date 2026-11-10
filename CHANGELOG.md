@@ -3,7 +3,7 @@
 All notable changes to VideoDart are documented here. Versions follow
 [semantic versioning](https://semver.org).
 
-## Unreleased
+## 0.8.0 (Beta), 2026-11-10
 
 ### Added
 
